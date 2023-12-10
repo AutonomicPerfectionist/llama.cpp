@@ -850,9 +850,14 @@ struct llama_mmap {
         int flags = MAP_SHARED;
         // prefetch/readahead impairs performance on NUMA systems
         if (numa) { prefetch = 0; }
+
+#ifdef GGML_USE_MPI
+        prefetch = 0;
+#endif
 #ifdef __linux__
         if (prefetch) { flags |= MAP_POPULATE; }
 #endif
+
         addr = mmap(NULL, file->size, PROT_READ, flags, fd, 0);
         if (addr == MAP_FAILED) {
             throw std::runtime_error(format("mmap failed: %s", strerror(errno)));
@@ -1488,6 +1493,7 @@ struct llama_context {
 
 #ifdef GGML_USE_MPI
     ggml_mpi_context * ctx_mpi = NULL;
+    ggml_mpi_context * ctx_mpi_orig = NULL;
 #endif
 };
 
@@ -1649,13 +1655,13 @@ static void llama_kv_cache_seq_rm(
     if (p1 < 0) p1 = std::numeric_limits<llama_pos>::max();
 
     for (uint32_t i = 0; i < cache.size; ++i) {
-        if (cache.cells[i].pos >= p0 && cache.cells[i].pos < p1) {
+        if ((cache.cells[i].pos >= p0 || cache.cells[i].pos < 0) && cache.cells[i].pos < p1) {
             if (seq_id < 0) {
                 cache.cells[i].seq_id.clear();
             } else if (cache.cells[i].has_seq_id(seq_id)) {
                 cache.cells[i].seq_id.erase(seq_id);
             } else {
-                continue;
+//                continue;
             }
             if (cache.cells[i].seq_id.empty()) {
                 // keep count of the number of used cells
@@ -3873,6 +3879,7 @@ struct llm_build_context {
         }
 
         for (int il = 0; il < n_layer; ++il) {
+            ggml_format_name(inpL, "layer_inp_%d", il); //MPI
             struct ggml_tensor * inpSA = inpL;
 
             // norm
@@ -3983,6 +3990,7 @@ struct llm_build_context {
         }
 
         for (int il = 0; il < n_layer; ++il) {
+            ggml_format_name(inpL, "layer_inp_%d", il); //MPI
             struct ggml_tensor * inpSA = inpL;
 
             cur = llm_build_norm(ctx0, inpL, hparams,
@@ -4103,6 +4111,7 @@ struct llm_build_context {
         }
 
         for (int il = 0; il < n_layer; ++il) {
+            ggml_format_name(inpL, "layer_inp_%d", il); //MPI
             struct ggml_tensor * attn_norm;
 
             attn_norm = llm_build_norm(ctx0, inpL, hparams,
@@ -4227,6 +4236,7 @@ struct llm_build_context {
         cb(inpL, "inpL", -1);
 
         for (int il = 0; il < n_layer; ++il) {
+            ggml_format_name(inpL, "layer_inp_%d", il); //MPI
             cur = llm_build_norm(ctx0, inpL, hparams,
                     model.layers[il].attn_norm,
                     model.layers[il].attn_norm_b,
@@ -4323,6 +4333,7 @@ struct llm_build_context {
         }
 
         for (int il = 0; il < n_layer; ++il) {
+            ggml_format_name(inpL, "layer_inp_%d", il); //MPI
             struct ggml_tensor * residual = inpL;
 
             cur = llm_build_norm(ctx0, inpL, hparams,
@@ -4525,6 +4536,7 @@ struct llm_build_context {
         cb(KQ_mask, "KQ_mask", -1);
 
         for (int il = 0; il < n_layer; ++il) {
+            ggml_format_name(inpL, "layer_inp_%d", il); //MPI
             struct ggml_tensor * inpSA = inpL;
 
             cur = llm_build_norm(ctx0, inpL, hparams,
@@ -4622,6 +4634,7 @@ struct llm_build_context {
         cb(inpL, "inp_norm", -1);
 
         for (int il = 0; il < n_layer; ++il) {
+            ggml_format_name(inpL, "layer_inp_%d", il); //MPI
             cur = llm_build_norm(ctx0, inpL, hparams,
                     model.layers[il].attn_norm,
                     model.layers[il].attn_norm_b,
@@ -4710,6 +4723,7 @@ struct llm_build_context {
         cb(KQ_mask, "KQ_mask", -1);
 
         for (int il = 0; il < n_layer; ++il) {
+            ggml_format_name(inpL, "layer_inp_%d", il); //MPI
             struct ggml_tensor * attn_norm;
 
             attn_norm = llm_build_norm(ctx0, inpL, hparams,
@@ -5406,23 +5420,17 @@ static struct ggml_cgraph * llama_build_graph(
     return result;
 }
 
-// decode a batch of tokens by evaluating the transformer
-//
-//   - lctx:      llama context
-//   - batch:     batch to evaluate
-//
-// return 0 on success
-// return positive int on warning
-// return negative int on error
-//
-static int llama_decode_internal(
-         llama_context & lctx,
-           llama_batch   batch) {
-    const uint32_t n_tokens = batch.n_tokens;
 
+
+static struct ggml_cgraph * llama_decode_internal_phased(
+            llama_context & lctx,
+            llama_batch  & batch,
+            uint8_t phase,
+            ggml_cgraph * cgraph) {
+    uint32_t n_tokens = batch.n_tokens;
     if (n_tokens == 0) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0", __func__);
-        return -1;
+        return nullptr;
     }
 
     const auto & model   = lctx.model;
@@ -5437,12 +5445,6 @@ static int llama_decode_internal(
     GGML_ASSERT((!batch.token && batch.embd) || (batch.token && !batch.embd)); // NOLINT
 
     const int64_t t_start_us = ggml_time_us();
-
-#ifdef GGML_USE_MPI
-    // TODO: needs fix after #3228
-    GGML_ASSERT(false && "not implemented");
-    //ggml_mpi_eval_init(lctx.ctx_mpi, &n_tokens, &n_past, &n_threads);
-#endif
 
     GGML_ASSERT(n_threads > 0);
 
@@ -5485,70 +5487,90 @@ static int llama_decode_internal(
         batch.seq_id = seq_id_arr.data();
     }
 
-    // if we have enough unused cells before the current head ->
-    //   better to start searching from the beginning of the cache, hoping to fill it
-    if (kv_self.head > kv_self.used + 2*n_tokens) {
-        kv_self.head = 0;
-    }
+    if (phase == 0) {
 
-    if (!llama_kv_cache_find_slot(kv_self, batch)) {
-        return 1;
-    }
-
-    // a heuristic, to avoid attending the full cache if it is not yet utilized
-    // after enough generations, the benefit from this heuristic disappears
-    // if we start defragmenting the cache, the benefit from this will be more important
-    //kv_self.n = std::max(32, GGML_PAD(llama_kv_cache_cell_max(kv_self), 32));   // TODO: this might be better for CUDA?
-    kv_self.n = std::min((int32_t) cparams.n_ctx, std::max(32, llama_kv_cache_cell_max(kv_self)));
-
-    //printf("kv_self.n = %5d, kv_self.used = %5d, kv_self.head = %5d\n", kv_self.n, kv_self.used, kv_self.head);
-
-    ggml_allocr_reset(lctx.alloc);
-
-    ggml_cgraph * gf = llama_build_graph(lctx, batch);
-
-    ggml_allocr_alloc_graph(lctx.alloc, gf);
-
-    struct ggml_tensor * res        = gf->nodes[gf->n_nodes - 1];
-    struct ggml_tensor * embeddings = gf->nodes[gf->n_nodes - 2];
-
-    GGML_ASSERT(strcmp(res->name,        "result_output") == 0);
-    GGML_ASSERT(strcmp(embeddings->name, "result_norm")   == 0);
-
-
-#ifdef GGML_USE_CUBLAS
-    for (int i = 0; i < gf->n_leafs; i++) {
-        ggml_tensor * node = gf->leafs[i];
-        if (node->backend == GGML_BACKEND_GPU && node->extra == NULL) {
-            ggml_cuda_assign_scratch_offset(node, (char*)node->data - (char *) lctx.buf_alloc.data);
-            ggml_cuda_copy_to_device(node);
+        // if we have enough unused cells before the current head ->
+        //   better to start searching from the beginning of the cache, hoping to fill it
+        if (kv_self.head > kv_self.used + 2*n_tokens) {
+            kv_self.head = 0;
         }
-    }
 
-    for (int i = 0; i < gf->n_nodes; i++) {
-        ggml_tensor * node = gf->nodes[i];
-        if (node->backend == GGML_BACKEND_GPU && node->extra == NULL) {
-            ggml_cuda_assign_scratch_offset(node, (char*)node->data - (char *) lctx.buf_alloc.data);
+#ifdef GGML_USE_MPI
+        // TODO: needs fix after #3228
+        if (!ggml_mpi_eval_init(lctx.ctx_mpi, &(batch.n_tokens), &(batch.token), &(batch.pos), &(batch.n_seq_id),
+                                &(batch.seq_id), &(batch.logits), false)) {
+            return nullptr;
         }
-    }
+        n_tokens = batch.n_tokens;
+#endif
+        if (!llama_kv_cache_find_slot(kv_self, batch)) {
+            printf("Cannot find cache slot\n");
+            return nullptr;
+        }
 
-    // HACK: ggml-alloc may change the tensor backend when reusing a parent, so force output to be on the CPU here if needed
-    if (!lctx.embedding.empty()) {
-        embeddings->backend = GGML_BACKEND_CPU;
-    }
-    res->backend = GGML_BACKEND_CPU;
+        // a heuristic, to avoid attending the full cache if it is not yet utilized
+        // after enough generations, the benefit from this heuristic disappears
+        // if we start defragmenting the cache, the benefit from this will be more important
+        //kv_self.n = std::max(32, GGML_PAD(llama_kv_cache_cell_max(kv_self), 32));   // TODO: this might be better for CUDA?
+        kv_self.n = std::min((int32_t) cparams.n_ctx, std::max(32, llama_kv_cache_cell_max(kv_self)));
+
+        //printf("kv_self.n = %5d, kv_self.used = %5d, kv_self.head = %5d\n", kv_self.n, kv_self.used, kv_self.head);
+
+        ggml_allocr_reset(lctx.alloc);
+        ggml_cgraph * gf = llama_build_graph(lctx, batch);
+
+        ggml_allocr_alloc_graph(lctx.alloc, gf);
+
+        struct ggml_tensor *res = gf->nodes[gf->n_nodes - 1];
+        struct ggml_tensor *embeddings = gf->nodes[gf->n_nodes - 2];
+
+        GGML_ASSERT(strcmp(res->name, "result_output") == 0);
+        GGML_ASSERT(strcmp(embeddings->name, "result_norm") == 0);
+
+#ifdef GGML_USE_MPI
+        const int64_t n_layer = hparams.n_layer;
+        ggml_mpi_graph_creation_post(lctx.ctx_mpi, gf, n_layer);
 #endif
 
-    // LLAMA_LOG_INFO("graph build time: %.3f ms (%d nodes, %d leafs)\n", (ggml_time_us() - t_start_us)/1000.0, gf->n_nodes, gf->n_leafs);
+#ifdef GGML_USE_CUBLAS
+        for (int i = 0; i < gf->n_leafs; i++) {
+            ggml_tensor * node = gf->leafs[i];
+            if (node->backend == GGML_BACKEND_GPU && node->extra == NULL) {
+                ggml_cuda_assign_scratch_offset(node, (char*)node->data - (char *) lctx.buf_alloc.data);
+                ggml_cuda_copy_to_device(node);
+            }
+        }
 
-    // for big prompts, if BLAS is enabled, it is better to use only one thread
-    // otherwise, the threads are spin-lock waiting for the BLAS calls and are degrading the performance
-    // TODO: this is mostly important for Apple Silicon where CBLAS is still performing very well
-    //       we still need some threads to process all non-mul_mat ops, but not too much to avoid interfering
-    //       with the BLAS calls. need a better solution
-    if (n_tokens >= 32 && ggml_cpu_has_blas() && !ggml_cpu_has_gpublas()) {
-        n_threads = std::min(4, n_threads);
-    }
+        for (int i = 0; i < gf->n_nodes; i++) {
+            ggml_tensor * node = gf->nodes[i];
+            if (node->backend == GGML_BACKEND_GPU && node->extra == NULL) {
+                ggml_cuda_assign_scratch_offset(node, (char*)node->data - (char *) lctx.buf_alloc.data);
+            }
+        }
+
+        // HACK: ggml-alloc may change the tensor backend when reusing a parent, so force output to be on the CPU here if needed
+        if (!lctx.embedding.empty()) {
+            embeddings->backend = GGML_BACKEND_CPU;
+        }
+        res->backend = GGML_BACKEND_CPU;
+#endif
+
+#ifdef GGML_USE_MPI
+        if (!ggml_mpi_graph_compute_pre(lctx.ctx_mpi, gf)) {
+            return nullptr;
+        }
+#endif
+
+        // LLAMA_LOG_INFO("graph build time: %.3f ms (%d nodes, %d leafs)\n", (ggml_time_us() - t_start_us)/1000.0, gf->n_nodes, gf->n_leafs);
+
+        // for big prompts, if BLAS is enabled, it is better to use only one thread
+        // otherwise, the threads are spin-lock waiting for the BLAS calls and are degrading the performance
+        // TODO: this is mostly important for Apple Silicon where CBLAS is still performing very well
+        //       we still need some threads to process all non-mul_mat ops, but not too much to avoid interfering
+        //       with the BLAS calls. need a better solution
+        if (n_tokens >= 32 && ggml_cpu_has_blas() && !ggml_cpu_has_gpublas()) {
+            n_threads = std::min(4, n_threads);
+        }
 
     // If all tensors can be run on the GPU then using more than 1 thread is detrimental.
     const bool full_offload_supported =
@@ -5560,108 +5582,183 @@ static int llama_decode_internal(
         model.arch == LLM_ARCH_STARCODER  ||
         model.arch == LLM_ARCH_STABLELM;
 
-    const bool fully_offloaded = model.n_gpu_layers >= (int) hparams.n_layer + 3;
-    if (ggml_cpu_has_cublas() && full_offload_supported && fully_offloaded) {
-        n_threads = 1;
-    }
-
-#if GGML_USE_MPI
-    const int64_t n_layer = hparams.n_layer;
-    ggml_mpi_graph_compute_pre(lctx.ctx_mpi, gf, n_layer);
-#endif
+        const bool fully_offloaded = model.n_gpu_layers >= (int) hparams.n_layer + 3;
+        if (ggml_cpu_has_cublas() && full_offload_supported && fully_offloaded) {
+            n_threads = 1;
+        }
 
 #ifdef GGML_USE_METAL
-    if (lctx.ctx_metal) {
-        ggml_metal_set_n_cb     (lctx.ctx_metal, n_threads);
-        ggml_metal_graph_compute(lctx.ctx_metal, gf);
-    } else {
-        ggml_graph_compute_helper(lctx.work_buffer, gf, n_threads);
-    }
+        if (lctx.ctx_metal) {
+            ggml_metal_set_n_cb     (lctx.ctx_metal, n_threads);
+            ggml_metal_graph_compute(lctx.ctx_metal, gf);
+        } else {
+            ggml_graph_compute_helper(lctx.work_buffer, gf, n_threads);
+        }
 #else
-    ggml_graph_compute_helper(lctx.work_buffer, gf, n_threads);
+        ggml_graph_compute_helper(lctx.work_buffer, gf, n_threads);
 #endif
 
 #if GGML_USE_MPI
-    ggml_mpi_graph_compute_post(lctx.ctx_mpi, gf, n_layer);
+        ggml_mpi_graph_compute_post(lctx.ctx_mpi, gf);
 #endif
 
-    // update the kv ring buffer
-    {
-        if (kv_self.has_shift) {
-            kv_self.has_shift = false;
-            for (uint32_t i = 0; i < kv_self.size; ++i) {
-                kv_self.cells[i].delta = 0;
+        // update the kv ring buffer
+        {
+            if (kv_self.has_shift) {
+                kv_self.has_shift = false;
+                for (uint32_t i = 0; i < kv_self.size; ++i) {
+                    kv_self.cells[i].delta = 0;
+                }
+            }
+
+            kv_self.head += n_tokens;
+
+            // Ensure kv cache head points to a valid index.
+            if (kv_self.head >= kv_self.size) {
+                kv_self.head = 0;
             }
         }
-
-        kv_self.head += n_tokens;
-
-        // Ensure kv cache head points to a valid index.
-        if (kv_self.head >= kv_self.size) {
-            kv_self.head = 0;
-        }
-    }
 
 #ifdef GGML_PERF
-    // print timing information per ggml operation (for debugging purposes)
-    // requires GGML_PERF to be defined
-    ggml_graph_print(gf);
+        // print timing information per ggml operation (for debugging purposes)
+        // requires GGML_PERF to be defined
+        ggml_graph_print(gf);
 #endif
 
-    // plot the computation graph in dot format (for debugging purposes)
-    //if (n_past%100 == 0) {
-    //    ggml_graph_dump_dot(gf, NULL, "llama.dot");
-    //}
+        return gf;
 
-    // extract logits
-    // TODO: do not compute and extract logits if only embeddings are needed
-    //       need to update the graphs to skip "result_output"
-    {
+    } else if (phase == 1) {
+        ggml_cgraph * gf = cgraph;
+        struct ggml_tensor *res = gf->nodes[gf->n_nodes - 1];
+        struct ggml_tensor *embeddings = gf->nodes[gf->n_nodes - 2];
+
+        // Resize logits
         auto & logits_out = lctx.logits;
+        {
 
-        if (batch.logits) {
-            logits_out.resize(n_vocab * n_tokens);
-            for (uint32_t i = 0; i < n_tokens; i++) {
-                if (batch.logits[i] == 0) {
-                    continue;
-                }
-                memcpy(logits_out.data() + (n_vocab*i), (float *) ggml_get_data(res) + (n_vocab*i), sizeof(float)*n_vocab);
+
+            if (batch.logits || lctx.logits_all) {
+                logits_out.resize(n_vocab * n_tokens);
+            } else {
+                logits_out.resize(n_vocab);
             }
-        } else if (lctx.logits_all) {
-            logits_out.resize(n_vocab * n_tokens);
-            memcpy(logits_out.data(), (float *) ggml_get_data(res), sizeof(float)*n_vocab*n_tokens);
-        } else {
-            logits_out.resize(n_vocab);
-            memcpy(logits_out.data(), (float *) ggml_get_data(res) + (n_vocab*(n_tokens - 1)), sizeof(float)*n_vocab);
         }
+
+#ifdef GGML_USE_MPI
+        if (ggml_mpi_size(lctx.ctx_mpi) > 1 && ggml_mpi_rank(lctx.ctx_mpi) == 0) {
+            ggml_mpi_recv_float_array(lctx.ctx_mpi, logits_out.data(), n_vocab * n_tokens, ggml_mpi_size(lctx.ctx_mpi) - 1, GGML_MPI_SYNC_LOGITS);
+        }
+
+        if (ggml_mpi_rank(lctx.ctx_mpi) == ggml_mpi_size(lctx.ctx_mpi) - 1) {
+
+#endif
+
+        auto * net_output = (float *) ggml_get_data(res);
+
+
+        // plot the computation graph in dot format (for debugging purposes)
+        //if (n_past%100 == 0) {
+        //    ggml_graph_dump_dot(gf, NULL, "llama.dot");
+        //}
+
+        // extract logits
+        // TODO: do not compute and extract logits if only embeddings are needed
+        //       need to update the graphs to skip "result_output"
+        {
+            if (batch.logits) {
+                for (uint32_t i = 0; i < n_tokens; i++) {
+                    if (batch.logits[i] == 0) {
+                        continue;
+                    }
+                    memcpy(logits_out.data() + (n_vocab*i),  net_output + (n_vocab*i), sizeof(float)*n_vocab);
+                }
+            } else if (lctx.logits_all) {
+                memcpy(logits_out.data(), net_output, sizeof(float)*n_vocab*n_tokens);
+            } else {
+                memcpy(logits_out.data(), net_output + (n_vocab*(n_tokens - 1)), sizeof(float)*n_vocab);
+            }
+        }
+
+        // extract embeddings
+        if (!lctx.embedding.empty()) {
+            auto & embedding_out = lctx.embedding;
+
+            embedding_out.resize(n_embd);
+            memcpy(embedding_out.data(), (float *) ggml_get_data(embeddings) + (n_embd*(n_tokens - 1)), sizeof(float)*n_embd);
+        }
+
+#ifdef GGML_USE_MPI
+        }
+        if (ggml_mpi_size(lctx.ctx_mpi) > 1 && ggml_mpi_rank(lctx.ctx_mpi) == ggml_mpi_size(lctx.ctx_mpi) - 1) {
+            ggml_mpi_send_float_array_async(lctx.ctx_mpi, logits_out.data(), n_vocab * n_tokens, 0, GGML_MPI_SYNC_LOGITS);
+        }
+#endif
+
+        // measure the performance only for the single-token evals
+        if (n_tokens == 1) {
+            lctx.t_eval_us += ggml_time_us() - t_start_us;
+            lctx.n_eval++;
+        }
+        else if (n_tokens > 1) {
+            lctx.t_p_eval_us += ggml_time_us() - t_start_us;
+            lctx.n_p_eval += n_tokens;
+        }
+
+        // get a more accurate load time, upon first eval
+        // TODO: fix this
+        if (!lctx.has_evaluated_once) {
+            lctx.t_load_us = ggml_time_us() - lctx.t_start_us;
+            lctx.has_evaluated_once = true;
+        }
+        return cgraph;
+
+    }
+    return nullptr;
+}
+
+// decode a batch of tokens by evaluating the transformer
+//
+//   - lctx:      llama context
+//   - batch:     batch to evaluate
+//
+// return 0 on success
+// return positive int on warning
+// return negative int on error
+//
+static int llama_decode_internal(
+        llama_context & lctx,
+        llama_batch   batch) {
+    struct ggml_cgraph * gf = llama_decode_internal_phased(lctx, batch, 0, nullptr);
+    if (gf != nullptr) {
+        return llama_decode_internal_phased(lctx, batch, 1, gf) != nullptr;
+    } else {
+        //printf("Graph is null\n");
+        return -1;
+    }
+}
+
+struct ggml_cgraph * llama_start_async_decode(
+        llama_context & lctx,
+        llama_batch  & batch) {
+    return llama_decode_internal_phased(lctx, batch, 0, nullptr);
+
+}
+
+int llama_finish_async_decode(
+        struct llama_context & lctx,
+        struct llama_batch &  batch,
+        struct ggml_cgraph * cgraph) {
+
+    int ret;
+    if (cgraph != nullptr) {
+
+        ret = llama_decode_internal_phased(lctx, batch, 1, cgraph) != nullptr;
+    } else {
+        ret = -1;
     }
 
-    // extract embeddings
-    if (!lctx.embedding.empty()) {
-        auto & embedding_out = lctx.embedding;
+    return ret;
 
-        embedding_out.resize(n_embd);
-        memcpy(embedding_out.data(), (float *) ggml_get_data(embeddings) + (n_embd*(n_tokens - 1)), sizeof(float)*n_embd);
-    }
-
-    // measure the performance only for the single-token evals
-    if (n_tokens == 1) {
-        lctx.t_eval_us += ggml_time_us() - t_start_us;
-        lctx.n_eval++;
-    }
-    else if (n_tokens > 1) {
-        lctx.t_p_eval_us += ggml_time_us() - t_start_us;
-        lctx.n_p_eval += n_tokens;
-    }
-
-    // get a more accurate load time, upon first eval
-    // TODO: fix this
-    if (!lctx.has_evaluated_once) {
-        lctx.t_load_us = ggml_time_us() - lctx.t_start_us;
-        lctx.has_evaluated_once = true;
-    }
-
-    return 0;
 }
 
 //
@@ -8412,6 +8509,14 @@ struct llama_model_quantize_params llama_model_quantize_default_params() {
     return result;
 }
 
+int llama_node_id(struct llama_context * ctx) {
+#ifdef GGML_USE_MPI
+    return ggml_mpi_rank(ctx->ctx_mpi);
+
+#endif
+    return 0;
+}
+
 int llama_max_devices(void) {
     return LLAMA_MAX_DEVICES;
 }
@@ -8675,22 +8780,57 @@ struct llama_context * llama_new_context_with_model(
 
 #ifdef GGML_USE_MPI
     ctx->ctx_mpi = ggml_mpi_init();
+    ctx->ctx_mpi_orig = ctx->ctx_mpi;
 
-    if (ggml_mpi_rank(ctx->ctx_mpi) > 0) {
-        // Enter a blocking eval loop with dummy input, letting rank=0 drive the process
-        // TODO: needs fix after #3228
-        GGML_ASSERT(false && "not implemented");
-        //const std::vector<llama_token> tmp(ctx->model.hparams.n_ctx, llama_token_bos(ctx));
-        //while (!llama_eval(ctx, tmp.data(), tmp.size(), 0, 0)) {};
-        llama_backend_free();
-        exit(1);
-    }
+
 #endif
 
     return ctx;
 }
 
+void llama_sync_token(struct llama_context * ctx, llama_token * token, int root) {
+#ifdef GGML_USE_MPI
+    ggml_mpi_synch_int(ctx->ctx_mpi, token, root);
+#endif
+}
+
+void llama_sync_token_data(struct llama_context * ctx, llama_token_data * data, int root) {
+#ifdef GGML_USE_MPI
+    ggml_mpi_synch_int(ctx->ctx_mpi, &(data->id), root);
+    ggml_mpi_synch_float(ctx->ctx_mpi, &(data->logit), root);
+    ggml_mpi_synch_float(ctx->ctx_mpi, &(data->p), root);
+#endif
+}
+
+void llama_swap_comm(struct llama_context * ctx) {
+#ifdef GGML_USE_MPI
+    ggml_mpi_context * temp = ctx->ctx_mpi;
+    ctx->ctx_mpi = ctx->ctx_mpi_orig;
+    ctx->ctx_mpi_orig = temp;
+#endif
+}
+
+void llama_split_comm(struct llama_context * ctx, int color) {
+#ifdef GGML_USE_MPI
+    ctx->ctx_mpi = ggml_mpi_split_comm(ctx->ctx_mpi, color, ggml_mpi_rank(ctx->ctx_mpi));
+#endif
+}
+
+void llama_split_layers_weighted(struct llama_context * ctx, float device_weights[], size_t num_weights) {
+#ifdef GGML_USE_MPI
+    if (ggml_mpi_rank(ctx->ctx_mpi) == 0 && ggml_mpi_size(ctx->ctx_mpi) != num_weights) {
+        GGML_ASSERT(false && "Must have same number of split percentages as devices");
+    }
+    uint16_t** ranges = ggml_mpi_split_range(ctx->ctx_mpi, 0, ctx->model.hparams.n_layer - 1, device_weights);
+    ggml_mpi_scatter_layers(ctx->ctx_mpi, ranges);
+    free(ranges);
+#endif
+}
+
 void llama_free(struct llama_context * ctx) {
+#ifdef GGML_USE_MPI
+    ggml_mpi_free(ctx->ctx_mpi);
+#endif
     delete ctx;
 }
 
@@ -8923,25 +9063,58 @@ int llama_get_kv_cache_used_cells(const struct llama_context * ctx) {
 }
 
 void llama_kv_cache_clear(struct llama_context * ctx) {
+#ifdef GGML_USE_MPI
+    ggml_mpi_sync_ints_pipelined(ctx->ctx_mpi, NULL, 0, 1);
+#endif
     llama_kv_cache_clear(ctx->kv_self);
 }
 
 void llama_kv_cache_seq_rm(struct llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+#ifdef GGML_USE_MPI
+    int32_t vals[3] = {seq_id, p0, p1};
+    ggml_mpi_sync_ints_pipelined(ctx->ctx_mpi, vals, 3, 2);
+    seq_id = vals[0];
+    p0 = vals[1];
+    p1 = vals[2];
+#endif
     llama_kv_cache_seq_rm(ctx->kv_self, seq_id, p0, p1);
 }
 
 void llama_kv_cache_seq_cp(struct llama_context * ctx, llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
+#ifdef GGML_USE_MPI
+    int32_t vals[4] = {seq_id_src, seq_id_dst, p0, p1};
+    ggml_mpi_sync_ints_pipelined(ctx->ctx_mpi, vals, 4, 3);
+    seq_id_src = vals[0];
+    seq_id_dst = vals[1];
+    p0 = vals[2];
+    p1 = vals[3];
+#endif
     if (seq_id_src == seq_id_dst) {
         return;
     }
+
     llama_kv_cache_seq_cp(ctx->kv_self, seq_id_src, seq_id_dst, p0, p1);
 }
 
 void llama_kv_cache_seq_keep(struct llama_context * ctx, llama_seq_id seq_id) {
+#ifdef GGML_USE_MPI
+    int32_t vals[1] = {seq_id};
+    ggml_mpi_sync_ints_pipelined(ctx->ctx_mpi, vals, 1, 4);
+    seq_id = vals[0];
+#endif
     llama_kv_cache_seq_keep(ctx->kv_self, seq_id);
 }
 
 void llama_kv_cache_seq_shift(struct llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos delta) {
+#ifdef GGML_USE_MPI
+    int32_t vals[4] = {seq_id, p0, p1, delta};
+    ggml_mpi_sync_ints_pipelined(ctx->ctx_mpi, vals, 4, 5);
+    seq_id = vals[0];
+    p0 = vals[1];
+    p1 = vals[2];
+    delta = vals[3];
+#endif
+
     llama_kv_cache_seq_shift(ctx->kv_self, seq_id, p0, p1, delta);
 }
 
@@ -9374,8 +9547,24 @@ int llama_eval(
                  llama_token * tokens,
                      int32_t   n_tokens,
                          int   n_past) {
-    llama_kv_cache_seq_rm(ctx->kv_self, -1, n_past, -1);
 
+
+#ifdef GGML_USE_MPI
+    if (ggml_mpi_rank(ctx->ctx_mpi) > 0) {
+        // Enter a blocking eval loop with dummy input, letting rank=0 drive the process
+        const int n_ctx = llama_n_ctx(ctx);
+        std::vector<llama_token> tmp(n_ctx, llama_token_bos(&(ctx->model)));
+        do {
+            //ggml_mpi_synch_int(ctx->ctx_mpi, &n_past);
+            llama_kv_cache_seq_rm(ctx->kv_self, -1, n_past, -1);
+        } while (llama_decode_internal(*ctx, llama_batch_get_one(tmp.data(), tmp.size(), n_past, 0)) >= 0);
+        llama_backend_free();
+        exit(1);
+    }
+#endif
+
+
+    llama_kv_cache_seq_rm(ctx->kv_self, -1, n_past, -1);
     const int ret = llama_decode_internal(*ctx, llama_batch_get_one(tokens, n_tokens, n_past, 0));
     if (ret < 0) {
         LLAMA_LOG_ERROR("%s: failed to decode, ret = %d\n", __func__, ret);
@@ -9459,9 +9648,59 @@ void llama_batch_free(struct llama_batch batch) {
     if (batch.logits)   free(batch.logits);
 }
 
+#ifdef GGML_USE_MPI
+
+int llama_process_mpi_worker(
+        struct llama_context * ctx,
+        struct llama_batch   batch) {
+    ggml_mpi_probe(ctx->ctx_mpi, -1, -1);
+    int tag = ggml_mpi_status_tag(ctx->ctx_mpi);
+    switch (tag) {
+        case GGML_MPI_DECODE:
+            return llama_decode_internal(*ctx, batch);
+            break;
+        case GGML_MPI_KV_CLEAR:
+            llama_kv_cache_clear(ctx);
+            break;
+        case GGML_MPI_KV_SEQ_RM:
+            llama_kv_cache_seq_rm(ctx, 1, -1, -1);
+            break;
+        case GGML_MPI_KV_SEQ_CP:
+            llama_kv_cache_seq_cp(ctx, 0, 0, 0, 0);
+            break;
+        case GGML_MPI_KV_SEQ_KEEP:
+            llama_kv_cache_seq_keep(ctx, 0);
+            break;
+        case GGML_MPI_KV_SEQ_SHIFT:
+            llama_kv_cache_seq_shift(ctx, 0, 0, 0, 0);
+            break;
+        case GGML_MPI_SHUTDOWN:
+            llama_free(ctx);
+            llama_backend_free();
+            exit(0);
+            break;
+    }
+    return 0;
+}
+
+#endif
+
 int llama_decode(
         struct llama_context * ctx,
           struct llama_batch   batch) {
+
+#ifdef GGML_USE_MPI
+    if (ggml_mpi_rank(ctx->ctx_mpi) > 0) {
+        // Enter a blocking eval loop with dummy input, letting rank=0 drive the process
+        const int n_ctx = llama_n_ctx(ctx);
+        std::vector<llama_token> tmp(n_ctx, llama_token_bos(&(ctx->model)));
+        while (llama_process_mpi_worker(ctx, batch) >= 0){};
+        llama_backend_free();
+        exit(1);
+    } else if (ggml_mpi_rank(ctx->ctx_mpi) < 0) {
+        return 0;
+    }
+#endif
     const int ret = llama_decode_internal(*ctx, batch);
     if (ret < 0) {
         LLAMA_LOG_ERROR("%s: failed to decode, ret = %d\n", __func__, ret);

@@ -45,8 +45,8 @@ int32_t get_num_physical_cores();
 struct gpt_params {
     uint32_t seed                           = -1;    // RNG seed
 
-    int32_t n_threads                       = get_num_physical_cores();
-    int32_t n_threads_batch                 = -1;    // number of threads to use for batch processing (-1 = use n_threads)
+    std::vector<int32_t> n_threads                       = {get_num_physical_cores()};
+    std::vector<int32_t> n_threads_batch                 = {-1};    // number of threads to use for batch processing (-1 = use n_threads)
     int32_t n_predict                       = -1;    // new tokens to predict
     int32_t n_ctx                           = 512;   // context size
     int32_t n_batch                         = 512;   // batch size for prompt processing (must be >=32 to use BLAS)
@@ -60,6 +60,7 @@ struct gpt_params {
     int32_t n_gpu_layers                    = -1;    // number of layers to store in VRAM (-1 - use default)
     int32_t n_gpu_layers_draft              = -1;    // number of layers to store in VRAM for the draft model (-1 - use default)
     int32_t main_gpu                        = 0;     // the GPU that is used for scratch and small tensors
+    std::vector<std::vector<float>> mpi_layer_split      = {{1.0}}; // list of percentages of the total number of layers
     float   tensor_split[LLAMA_MAX_DEVICES] = {0};   // how split tensors should be distributed across GPUs
     int32_t n_beams                         = 0;     // if non-zero then use beam search of given width.
     float   rope_freq_base                  = 0.0f;  // RoPE base frequency

@@ -2,6 +2,7 @@
 
 #include "console.h"
 #include "llama.h"
+#include "build-info.h"
 
 #include <cassert>
 #include <cinttypes>
@@ -14,6 +15,9 @@
 #include <sstream>
 #include <string>
 #include <vector>
+
+// TODO add Windows support
+#include <wordexp.h>
 
 #if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__))
 #include <signal.h>
@@ -41,9 +45,9 @@ static bool is_interacting = false;
 
 
 static void write_logfile(
-    const llama_context * ctx, const gpt_params & params, const llama_model * model,
-    const std::vector<llama_token> & input_tokens, const std::string & output,
-    const std::vector<llama_token> & output_tokens
+        const llama_context * ctx, const gpt_params & params, const llama_model * model,
+        const std::vector<llama_token> & input_tokens, const std::string & output,
+        const std::vector<llama_token> & output_tokens
 ) {
     if (params.logdir.empty()) {
         return;
@@ -104,9 +108,40 @@ int main(int argc, char ** argv) {
     gpt_params params;
     g_params = &params;
 
-    if (!gpt_params_parse(argc, argv, params)) {
+    if (argc > 2) {
+        fprintf(stderr, "Must only have one argument, the file to read options from.\n");
+        return 2;
+    }
+
+    // Manually add the path used to launch this program to the
+    // options
+    std::string rawOptions = argv[0];
+    rawOptions += ' ';
+    std::ifstream optionsFile(argv[1]);
+    if (optionsFile.is_open()) {
+        // Read in the options file, appending to the launch path
+        std::ostringstream buf;
+        buf << optionsFile.rdbuf();
+        rawOptions += buf.str();
+        optionsFile.close();
+
+    } else {
+        fprintf(stderr, "Cannot open options file at path %s\n", argv[1]);
+        return 3;
+    }
+
+    // wordexp doesn't work right if there's a trailing newline, so strip it
+    rawOptions.erase(rawOptions.find_last_not_of(" \t\n\r\f\v") + 1);
+
+    wordexp_t  splitOptions;
+    wordexp(rawOptions.c_str(), &splitOptions, WRDE_NOCMD);
+
+    // Now we can parse like normal, but using the loaded options instead of the passed argv
+    if (gpt_params_parse(splitOptions.we_wordc, splitOptions.we_wordv, params) == false) {
+        wordfree(&splitOptions);
         return 1;
     }
+    wordfree(&splitOptions);
     llama_sampling_params & sparams = params.sparams;
 
 #ifndef LOG_DISABLE_LOGS
@@ -152,8 +187,8 @@ int main(int argc, char ** argv) {
         LOG_TEE("%s: warning: scaling RoPE frequency by %g.\n", __func__, params.rope_freq_scale);
     }
 
-    LOG_TEE("%s: build = %d (%s)\n",      __func__, LLAMA_BUILD_NUMBER, LLAMA_COMMIT);
-    LOG_TEE("%s: built with %s for %s\n", __func__, LLAMA_COMPILER, LLAMA_BUILD_TARGET);
+    LOG_TEE("%s: build = %d (%s)\n", __func__, BUILD_NUMBER, BUILD_COMMIT);
+    LOG_TEE("%s: built with %s for %s\n", __func__, BUILD_COMPILER, BUILD_TARGET);
 
     if (params.seed == LLAMA_DEFAULT_SEED) {
         params.seed = time(NULL);
@@ -188,8 +223,6 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    llama_split_layers_weighted(ctx, params.mpi_layer_split[0].data(), params.mpi_layer_split[0].size());
-
     const int n_ctx_train = llama_n_ctx_train(model);
     const int n_ctx = llama_n_ctx(ctx);
     LOG("n_ctx: %d\n", n_ctx);
@@ -204,6 +237,8 @@ int main(int argc, char ** argv) {
         LOG_TEE("\n");
         LOG_TEE("%s\n", get_system_info(params).c_str());
     }
+
+    llama_split_layers_weighted(ctx, params.mpi_layer_split.data(), params.mpi_layer_split.size());
 
     std::string path_session = params.path_prompt_cache;
     std::vector<llama_token> session_tokens;
@@ -231,16 +266,13 @@ int main(int argc, char ** argv) {
         }
     }
 
-    const bool add_bos = llama_should_add_bos_token(model);
+    const bool add_bos = llama_vocab_type(model) == LLAMA_VOCAB_TYPE_SPM;
     LOG("add_bos: %d\n", add_bos);
 
     std::vector<llama_token> embd_inp;
 
-    if (params.interactive_first || params.instruct || params.chatml || !params.prompt.empty() || session_tokens.empty()) {
+    if (params.interactive_first || params.instruct || !params.prompt.empty() || session_tokens.empty()) {
         LOG("tokenize the prompt\n");
-        if (params.chatml) {
-            params.prompt = "<|im_start|>system\n" + params.prompt + "<|im_end|>";
-        }
         embd_inp = ::llama_tokenize(ctx, params.prompt, add_bos, true);
     } else {
         LOG("use session tokens\n");
@@ -295,10 +327,10 @@ int main(int argc, char ** argv) {
             LOG_TEE("%s: session file has exact match for prompt!\n", __func__);
         } else if (n_matching_session_tokens < (embd_inp.size() / 2)) {
             LOG_TEE("%s: warning: session file has low similarity to prompt (%zu / %zu tokens); will mostly be reevaluated\n",
-                __func__, n_matching_session_tokens, embd_inp.size());
+                    __func__, n_matching_session_tokens, embd_inp.size());
         } else {
             LOG_TEE("%s: session file matches %zu / %zu tokens of prompt\n",
-                __func__, n_matching_session_tokens, embd_inp.size());
+                    __func__, n_matching_session_tokens, embd_inp.size());
         }
 
         // remove any "future" tokens that we might have inherited from the previous session
@@ -318,7 +350,7 @@ int main(int argc, char ** argv) {
     }
 
     // number of tokens to keep when resetting context
-    if (params.n_keep < 0 || params.n_keep > (int) embd_inp.size() || params.instruct || params.chatml) {
+    if (params.n_keep < 0 || params.n_keep > (int) embd_inp.size() || params.instruct) {
         params.n_keep = (int)embd_inp.size();
     }
 
@@ -329,22 +361,10 @@ int main(int argc, char ** argv) {
     LOG("inp_pfx: %s\n", LOG_TOKENS_TOSTR_PRETTY(ctx, inp_pfx).c_str());
     LOG("inp_sfx: %s\n", LOG_TOKENS_TOSTR_PRETTY(ctx, inp_sfx).c_str());
 
-    // chatml prefix & suffix
-    const auto cml_pfx = ::llama_tokenize(ctx, "\n<|im_start|>user\n", add_bos, true);
-    const auto cml_sfx = ::llama_tokenize(ctx, "<|im_end|>\n<|im_start|>assistant\n", false, true);
-
-    LOG("cml_pfx: %s\n", LOG_TOKENS_TOSTR_PRETTY(ctx, cml_pfx).c_str());
-    LOG("cml_sfx: %s\n", LOG_TOKENS_TOSTR_PRETTY(ctx, cml_sfx).c_str());
-
     // in instruct mode, we inject a prefix and a suffix to each input by the user
     if (params.instruct) {
         params.interactive_first = true;
         params.antiprompt.push_back("### Instruction:\n\n");
-    }
-    // similar for chatml mode
-    else if (params.chatml) {
-        params.interactive_first = true;
-        params.antiprompt.push_back("<|im_start|>user\n");
     }
 
     // enable interactive mode if interactive start is specified
@@ -370,7 +390,7 @@ int main(int argc, char ** argv) {
         }
 
         if (params.n_keep > 0) {
-        LOG_TEE("%s: static prompt based on n_keep: '", __func__);
+            LOG_TEE("%s: static prompt based on n_keep: '", __func__);
             for (int i = 0; i < params.n_keep; i++) {
                 LOG_TEE("%s", llama_token_to_piece(ctx, embd_inp[i]).c_str());
             }
@@ -563,9 +583,9 @@ int main(int argc, char ** argv) {
                     embd_guidance = guidance_inp;
                     if (embd.begin() + original_prompt_len < embd.end()) {
                         embd_guidance.insert(
-                            embd_guidance.end(),
-                            embd.begin() + original_prompt_len,
-                            embd.end()
+                                embd_guidance.end(),
+                                embd.begin() + original_prompt_len,
+                                embd.end()
                         );
                     }
 
@@ -691,8 +711,8 @@ int main(int argc, char ** argv) {
                 for (std::string & antiprompt : params.antiprompt) {
                     size_t extra_padding = params.interactive ? 0 : 2;
                     size_t search_start_pos = last_output.length() > static_cast<size_t>(antiprompt.length() + extra_padding)
-                        ? last_output.length() - static_cast<size_t>(antiprompt.length() + extra_padding)
-                        : 0;
+                                              ? last_output.length() - static_cast<size_t>(antiprompt.length() + extra_padding)
+                                              : 0;
 
                     if (last_output.find(antiprompt, search_start_pos) != std::string::npos) {
                         if (params.interactive) {
@@ -722,7 +742,7 @@ int main(int argc, char ** argv) {
 
                     is_interacting = true;
                     printf("\n");
-                } else if (params.instruct || params.chatml) {
+                } else if (params.instruct) {
                     is_interacting = true;
                 }
             }
@@ -730,7 +750,7 @@ int main(int argc, char ** argv) {
             if (n_past > 0 && is_interacting) {
                 LOG("waiting for user input\n");
 
-                if (params.instruct || params.chatml) {
+                if (params.instruct) {
                     printf("\n> ");
                 }
 
@@ -777,12 +797,6 @@ int main(int argc, char ** argv) {
                         n_consumed = embd_inp.size();
                         embd_inp.insert(embd_inp.end(), inp_pfx.begin(), inp_pfx.end());
                     }
-                    // chatml mode: insert user chat prefix
-                    if (params.chatml && !is_antiprompt) {
-                        LOG("inserting chatml prefix\n");
-                        n_consumed = embd_inp.size();
-                        embd_inp.insert(embd_inp.end(), cml_pfx.begin(), cml_pfx.end());
-                    }
                     if (params.escape) {
                         process_escapes(buffer);
                     }
@@ -800,11 +814,6 @@ int main(int argc, char ** argv) {
                     if (params.instruct) {
                         LOG("inserting instruction suffix\n");
                         embd_inp.insert(embd_inp.end(), inp_sfx.begin(), inp_sfx.end());
-                    }
-                    // chatml mode: insert assistant chat suffix
-                    if (params.chatml) {
-                        LOG("inserting chatml suffix\n");
-                        embd_inp.insert(embd_inp.end(), cml_sfx.begin(), cml_sfx.end());
                     }
 
                     for (size_t i = original_size; i < embd_inp.size(); ++i) {
@@ -831,7 +840,7 @@ int main(int argc, char ** argv) {
         }
 
         // end of text token
-        if (!embd.empty() && embd.back() == llama_token_eos(model) && !(params.instruct || params.interactive || params.chatml)) {
+        if (!embd.empty() && embd.back() == llama_token_eos(model) && !(params.instruct || params.interactive)) {
             LOG_TEE(" [end of text]\n");
             break;
         }

@@ -12,7 +12,6 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdbool.h>
-
 #ifdef LLAMA_SHARED
 #    if defined(_WIN32) && !defined(__MINGW32__)
 #        ifdef LLAMA_BUILD
@@ -273,6 +272,23 @@ extern "C" {
                              const char * path_model,
             struct llama_model_params     params);
 
+    LLAMA_API void llama_split_layers_weighted(struct llama_context * ctx, float device_weights[], size_t num_weights);
+
+    LLAMA_API void llama_swap_comm(struct llama_context * ctx);
+
+    LLAMA_API void llama_sync_token(struct llama_context * ctx, llama_token * token, int root);
+
+    LLAMA_API struct ggml_cgraph * llama_start_async_decode(struct llama_context & lctx,
+                                                                   struct llama_batch &  batch);
+
+    LLAMA_API int llama_finish_async_decode(struct llama_context & lctx,
+                                                                    struct llama_batch  & batch,
+                                                                    struct ggml_cgraph * cgraph);
+
+    LLAMA_API void llama_sync_token_data(struct llama_context * ctx, llama_token_data * data, int root);
+
+    LLAMA_API void llama_split_comm(struct llama_context * ctx, int color);
+
     LLAMA_API void llama_free_model(struct llama_model * model);
 
     LLAMA_API struct llama_context * llama_new_context_with_model(
@@ -283,6 +299,11 @@ extern "C" {
     LLAMA_API void llama_free(struct llama_context * ctx);
 
     LLAMA_API int64_t llama_time_us(void);
+
+    // Get the ID of this compute node, usually 0
+    // unless running MPI, in which case it is the rank of the node
+    LLAMA_API int llama_node_id(struct llama_context * ctx);
+
 
     LLAMA_API int  llama_max_devices    (void);
     LLAMA_API bool llama_mmap_supported (void);
