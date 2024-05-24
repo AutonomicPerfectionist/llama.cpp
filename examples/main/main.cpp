@@ -697,6 +697,9 @@ int main(int argc, char ** argv) {
 
                 LOG("saved session to %s\n", path_session.c_str());
             }
+            llama_pop_request(ctx);
+
+            llama_synchronize(ctx);
 
             const llama_token id = llama_sampling_sample(ctx_sampling, ctx, ctx_guidance);
 

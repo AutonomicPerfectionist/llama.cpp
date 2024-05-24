@@ -421,10 +421,10 @@ void ggml_mpi_sync_ints_pipelined(
         return;
     }
     ggml_mpi_sync_pipelined(ctx_mpi, vals, count, MPI_INT32_T, tag);
-    int old_trans = ctx_mpi->trans_id;
-    ggml_mpi_sync_pipelined(ctx_mpi, &ctx_mpi->trans_id, 1, MPI_INT32_T, GGML_MPI_TRANS_ID);
-    ctx_mpi->recv_trans_id = ctx_mpi->trans_id;
-    ctx_mpi->trans_id = old_trans;
+//    int old_trans = ctx_mpi->trans_id;
+//    ggml_mpi_sync_pipelined(ctx_mpi, &ctx_mpi->trans_id, 1, MPI_INT32_T, GGML_MPI_TRANS_ID);
+//    ctx_mpi->recv_trans_id = ctx_mpi->trans_id;
+//    ctx_mpi->trans_id = old_trans;
 }
 
 void ggml_mpi_sync_pipelined_back(

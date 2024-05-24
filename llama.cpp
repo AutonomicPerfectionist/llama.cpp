@@ -9335,12 +9335,12 @@ static int llama_decode_internal(
         //printf("kv_self.n = %5d, kv_self.used = %5d, kv_self.head = %5d\n", kv_self.n, kv_self.used, kv_self.head);
 
 
-//        auto* data = new std::pair<std::unordered_map<int, bool>*, int>;
-//        data->first = new std::unordered_map<int, bool>;
-//        *data->first = lctx.model.canceled_batches;
-//        data->second = batch_all.batch_id;
+        auto* data = new std::pair<std::unordered_map<int, bool>*, int>;
+        data->first = new std::unordered_map<int, bool>;
+        *data->first = lctx.model.canceled_batches;
+        data->second = batch_all.batch_id;
         ggml_backend_sched_reset(lctx.sched);
-        ggml_backend_sched_set_eval_callback(lctx.sched, lctx.cparams.cb_eval, lctx.cparams.cb_eval_user_data);
+        ggml_backend_sched_set_eval_callback(lctx.sched, &abort_callback, data);
 
         ggml_cgraph * gf = llama_build_graph(lctx, u_batch, false);
 
@@ -9385,7 +9385,7 @@ static int llama_decode_internal(
 
         llama_graph_compute(lctx, gf, n_threads);
         ggml_backend_sched_set_eval_callback(lctx.sched, nullptr, nullptr);
-//        lctx.model.canceled_batches = *data->first;
+        lctx.model.canceled_batches = *data->first;
 
 
         // update the kv ring buffer

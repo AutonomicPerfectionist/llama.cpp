@@ -1,5 +1,6 @@
 #include "common.h"
 #include "llama.h"
+#include "ggml-mpi.h"
 
 #include <cmath>
 #include <cstdio>
@@ -7,7 +8,7 @@
 #include <vector>
 #include <set>
 
-#define SPEC_VOCAB_MAX_SIZE_DIFFERENCE  100
+#define SPEC_VOCAB_MAX_SIZE_DIFFERENCE  200
 #define SPEC_VOCAB_CHECK_START_TOKEN_ID 5
 
 struct seq_draft {
@@ -205,6 +206,9 @@ int main(int argc, char ** argv) {
         std::string token_str;
 
         // loop until we fail to accept a drafted token or we run out of drafted tokens
+        llama_pop_request(ctx_tgt);
+
+        llama_synchronize(ctx_tgt);
         while (true) {
 
             // check if the target token matches any of the drafts
@@ -322,6 +326,12 @@ int main(int argc, char ** argv) {
                     // sample from the target model
                     LOG("sampling target: s_keep = %3d, i_dft = %3d, i_batch_tgt = %3d\n", s_keep, i_dft, drafts[s_keep].i_batch_tgt[i_dft]);
                     token_id = llama_sampling_sample(ctx_sampling, ctx_tgt, NULL, drafts[s_keep].i_batch_tgt[i_dft]);
+                    llama_switch_partition(ctx_tgt, MPI_PARTITION_ROOTS);
+                    LOG("Swapped comm to pipeline roots, id %d\n", llama_node_id(ctx_tgt));
+
+                    llama_sync_int32_t(ctx_tgt, &token_id, 0);
+
+                    llama_switch_partition(ctx_tgt, MPI_PARTITION_MODEL);
 
                     llama_sampling_accept(ctx_sampling, ctx_tgt, token_id, true);
 
@@ -437,14 +447,38 @@ int main(int argc, char ** argv) {
                 drafts[s].skip = false;
             }
 
+            llama_pop_request(ctx_dft);
+
+            llama_synchronize(ctx_dft);
+
             for (int s = 0; s < n_seq_dft; ++s) {
                 if (!drafts[s].drafting || drafts[s].skip) {
                     continue;
                 }
 
+                // Swap back to pipeline roots
+                llama_switch_partition(ctx_dft, MPI_PARTITION_ROOTS);
+                LOG("Swapped comm to pipeline roots, id %d\n", llama_node_id(ctx_dft));
+
+                llama_sync_int32_t(ctx_dft, &(drafts[s].i_batch_dft), 1);
+                llama_switch_partition(ctx_dft, MPI_PARTITION_MODEL);
+
                 llama_sampling_sample(drafts[s].ctx_sampling, ctx_dft, NULL, drafts[s].i_batch_dft);
 
-                const auto & cur_p = drafts[s].ctx_sampling->cur;
+                auto & cur_p = drafts[s].ctx_sampling->cur;
+
+                cur_p.reserve(9);
+                llama_switch_partition(ctx_dft, MPI_PARTITION_ROOTS);
+
+                llama_sync_token_data(ctx_dft, cur_p.data(), 1);
+                // TODO investigate potential bottleneck
+                for (int k = 1; k < 8; ++k) {
+                    llama_sync_token_data(ctx_dft, &(cur_p[k]), 1);
+                }
+
+                // Back to draft pipeline only
+                llama_switch_partition(ctx_dft, MPI_PARTITION_MODEL);
+                LOG("Swapped comm to draft only, id %d\n", llama_node_id(ctx_dft));
 
                 for (int k = 0; k < std::min(n_seq_dft + 3, (int) cur_p.size()); ++k) {
                     LOG(" - draft candidate %3d for seq %3d, pos %3d: %6d (%8.3f) '%s'\n",

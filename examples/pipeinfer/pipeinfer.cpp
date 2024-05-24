@@ -10,7 +10,7 @@
 #include <stdint.h>
 
 
-#define SPEC_VOCAB_MAX_SIZE_DIFFERENCE  100
+#define SPEC_VOCAB_MAX_SIZE_DIFFERENCE  200
 #define SPEC_VOCAB_CHECK_START_TOKEN_ID 5
 
 struct seq_draft {
@@ -1308,8 +1308,8 @@ void check_for_cancel(llama_context *ctx_tgt, int n_past_tgt, std::deque<struct 
 
 
                     size_t index = run.prefix_n_past_tgt + draft_index;
-                    LOG("Looping over run starting at gen index %zu, draft index %zu, prefix_n_past_tgt %d, n_past_tgt %d, generated size %zu\n",
-                        index, draft_index, run.prefix_n_past_tgt, n_past_tgt, generated.size());
+                    LOG("Looping over run w/ id %zu starting at gen index %zu, draft index %zu, prefix_n_past_tgt %d, n_past_tgt %d, generated size %zu\n",
+                        run.batch.batch_id, index, draft_index, run.prefix_n_past_tgt, n_past_tgt, generated.size());
                     while (index < generated.size() && draft_index < concat_tokens.size() &&
                            generated.size() > (size_t) run.prefix_n_past_tgt) {
                         LOG("Checking draft at index %zu and generated index %zu\n", draft_index, index);
@@ -1359,7 +1359,7 @@ void check_for_cancel(llama_context *ctx_tgt, int n_past_tgt, std::deque<struct 
         }
     }
 
-//    if (!canceled_batches.empty()) {
-//        llama_cancel_run(ctx_tgt, canceled_batches.data(), canceled_batches.size());
-//    }
+    if (!canceled_batches.empty()) {
+        llama_cancel_run(ctx_tgt, canceled_batches.data(), canceled_batches.size());
+    }
 }
