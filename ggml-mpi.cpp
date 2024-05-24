@@ -1053,7 +1053,7 @@ const static auto EMPTY_BUFFER_TYPE = new ggml_backend_buffer_type{
 
 GGML_CALL static ggml_backend_buffer_t ggml_backend_mpi_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
 //    fprintf(stderr, "ALLOCATING BUFFER WITH COMM SIZE %zu AND RANK %d\n", ggml_backend_mpi_buffer_type_ctx(buft)->size, ggml_backend_mpi_buffer_type_ctx(buft)->rank);
-    GGML_ASSERT(ggml_backend_mpi_buffer_type_ctx(buft)->size < 3 && ggml_backend_mpi_buffer_type_ctx(buft)->rank < 2);
+//    GGML_ASSERT(ggml_backend_mpi_buffer_type_ctx(buft)->size < 3 && ggml_backend_mpi_buffer_type_ctx(buft)->rank < 2);
     auto* buffer = ggml_backend_mpi_wrap_buffer(
             ggml_backend_buft_alloc_buffer(ggml_backend_mpi_buffer_type_unwrap(buft), size)
             );
