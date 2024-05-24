@@ -86,6 +86,7 @@
 #include <thread>
 #include <type_traits>
 #include <unordered_map>
+#include <atomic>
 
 #if defined(_MSC_VER)
 #pragma warning(disable: 4244 4267) // possible loss of data
@@ -1468,74 +1469,12 @@ static std::string llama_token_to_piece(const struct llama_context * ctx, llama_
 
     return std::string(result.data(), result.size());
 }
+static ggml_backend_buffer_type_t llama_default_buffer_type_cpu(const llama_model & model, bool host_buffer);
+static ggml_backend_buffer_type_t llama_default_buffer_type_offload(llama_model & model, int gpu);
 
-static ggml_backend_buffer_type_t llama_default_buffer_type_cpu(bool host_buffer) {
-    ggml_backend_buffer_type_t buft = nullptr;
 
-#if defined(GGML_USE_CUBLAS)
-    // host buffers should only be used when data is expected to be copied to/from the GPU
-    if (host_buffer) {
-        buft = ggml_backend_cuda_host_buffer_type();
-    }
-#elif defined(GGML_USE_SYCL)
-    if (host_buffer) {
-        buft = ggml_backend_sycl_host_buffer_type();
-    }
-#elif defined(GGML_USE_CPU_HBM)
-    buft = ggml_backend_cpu_hbm_buffer_type();
-#elif defined(GGML_USE_VULKAN)
-    if (host_buffer) {
-        buft = ggml_backend_vk_host_buffer_type();
-    }
-#endif
 
-    if (buft == nullptr) {
-        buft = ggml_backend_cpu_buffer_type();
-    }
-
-#if defined(GGML_USE_MPI)
-    buft = ggml_backend_mpi_wrap_buffer_type(buft);
-#endif
-    return buft;
-
-    GGML_UNUSED(host_buffer);
-}
-
-static ggml_backend_buffer_type_t llama_default_buffer_type_offload(int gpu) {
-    ggml_backend_buffer_type_t buft = nullptr;
-
-#ifdef GGML_USE_METAL
-    buft = ggml_backend_metal_buffer_type();
-#elif defined(GGML_USE_CUBLAS)
-    buft = ggml_backend_cuda_buffer_type(gpu);
-#elif defined(GGML_USE_VULKAN)
-    buft = ggml_backend_vk_buffer_type(gpu);
-#elif defined(GGML_USE_SYCL)
-    buft = ggml_backend_sycl_buffer_type(gpu);
-#elif defined(GGML_USE_CLBLAST)
-    buft = ggml_backend_opencl_buffer_type();
-#elif defined(GGML_USE_KOMPUTE)
-    buft = ggml_backend_kompute_buffer_type(gpu);
-    if (buft == nullptr) {
-        LLAMA_LOG_WARN("%s: cannot use GPU %d, check `vulkaninfo --summary`\n", __func__, gpu);
-    }
-#endif
-
-    if (buft == nullptr) {
-        buft = llama_default_buffer_type_cpu(true);
-    }
-
-#ifdef GGML_USE_MPI
-    else {
-        buft = ggml_backend_mpi_wrap_buffer_type(buft);
-    }
-#endif
-    return buft;
-
-    GGML_UNUSED(gpu);
-}
-
-static ggml_backend_buffer_type_t llama_default_buffer_type_split(int fallback_gpu, const float * tensor_split) {
+static ggml_backend_buffer_type_t llama_default_buffer_type_split(llama_model & model, int fallback_gpu, const float * tensor_split) {
     ggml_backend_buffer_type_t buft = nullptr;
 
 #ifdef GGML_USE_CUBLAS
@@ -1551,7 +1490,7 @@ static ggml_backend_buffer_type_t llama_default_buffer_type_split(int fallback_g
 #endif
 
     if (buft == nullptr) {
-        buft = llama_default_buffer_type_offload(fallback_gpu);
+        buft = llama_default_buffer_type_offload(model, fallback_gpu);
     }
 
 
@@ -2055,7 +1994,18 @@ struct llama_model {
     int64_t t_start_us = 0;
 
 #ifdef GGML_USE_MPI
-    ggml_mpi_context * ctx_mpi = nullptr;
+    mutable ggml_mpi_context * ctx_mpi;
+    std::vector<ggml_mpi_context *> mpi_partitions;
+    mutable std::deque<ggml_backend_t> waiting_backends{};
+    mutable std::unordered_map<int, bool> canceled_batches{};
+
+    void mpi_switch_partitions(size_t partition) const {
+        size_t s = ggml_mpi_size(ctx_mpi);
+        int r = ggml_mpi_rank(ctx_mpi);
+        ctx_mpi = mpi_partitions[partition];
+//        fprintf(stderr, "SWITCHING TO PARTITION %zu, OLD SIZE AND RANK: %zu, %d, NEW SIZE AND RANK: %zu, %d\n", partition, s, r, ggml_mpi_size(ctx_mpi), ggml_mpi_rank(ctx_mpi));
+    }
+
 #endif
 
     ~llama_model() {
@@ -2166,6 +2116,78 @@ struct llama_context {
     struct llama_control_vector cvec;
 };
 
+static ggml_backend_buffer_type_t llama_default_buffer_type_cpu(const llama_model & model, bool host_buffer) {
+    ggml_backend_buffer_type_t buft = nullptr;
+
+#if defined(GGML_USE_CUBLAS)
+    // host buffers should only be used when data is expected to be copied to/from the GPU
+    if (host_buffer) {
+        buft = ggml_backend_cuda_host_buffer_type();
+    }
+#elif defined(GGML_USE_SYCL)
+    if (host_buffer) {
+        buft = ggml_backend_sycl_host_buffer_type();
+    }
+#elif defined(GGML_USE_CPU_HBM)
+    buft = ggml_backend_cpu_hbm_buffer_type();
+#elif defined(GGML_USE_VULKAN)
+    if (host_buffer) {
+        buft = ggml_backend_vk_host_buffer_type();
+    }
+#endif
+
+    if (buft == nullptr) {
+        buft = ggml_backend_cpu_buffer_type();
+    }
+
+#if defined(GGML_USE_MPI)
+    buft = ggml_backend_mpi_wrap_buffer_type(buft);
+    ggml_backend_mpi_buffer_type_init_with_context(buft, model.ctx_mpi);
+
+#endif
+    return buft;
+
+    GGML_UNUSED(host_buffer);
+}
+
+static ggml_backend_buffer_type_t llama_default_buffer_type_offload(llama_model & model, int gpu) {
+    ggml_backend_buffer_type_t buft = nullptr;
+
+#ifdef GGML_USE_METAL
+    buft = ggml_backend_metal_buffer_type();
+#elif defined(GGML_USE_CUBLAS)
+    buft = ggml_backend_cuda_buffer_type(gpu);
+#elif defined(GGML_USE_VULKAN)
+    buft = ggml_backend_vk_buffer_type(gpu);
+#elif defined(GGML_USE_SYCL)
+    buft = ggml_backend_sycl_buffer_type(gpu);
+#elif defined(GGML_USE_CLBLAST)
+    buft = ggml_backend_opencl_buffer_type();
+#elif defined(GGML_USE_KOMPUTE)
+    buft = ggml_backend_kompute_buffer_type(gpu);
+    if (buft == nullptr) {
+        LLAMA_LOG_WARN("%s: cannot use GPU %d, check `vulkaninfo --summary`\n", __func__, gpu);
+    }
+#endif
+
+    if (buft == nullptr) {
+        buft = llama_default_buffer_type_cpu(model, true);
+        ggml_backend_mpi_buffer_type_init_with_context(buft, model.ctx_mpi);
+
+    }
+
+#ifdef GGML_USE_MPI
+    else {
+        buft = ggml_backend_mpi_wrap_buffer_type(buft);
+        ggml_backend_mpi_buffer_type_init_with_context(buft, model.ctx_mpi);
+
+    }
+#endif
+    return buft;
+
+    GGML_UNUSED(gpu);
+}
+
 //
 // kv cache helpers
 //
@@ -2177,6 +2199,7 @@ static bool llama_kv_cache_init(
                          ggml_type   type_v,
                           uint32_t   kv_size,
                               bool   offload) {
+
     const struct llama_hparams & hparams = model.hparams;
 
     const uint32_t n_embd_k_gqa = hparams.n_embd_k_gqa() + hparams.n_embd_k_s();
@@ -2223,7 +2246,7 @@ static bool llama_kv_cache_init(
             buft_layer_count[model.buft_layer[i].buft]++;
         }
     } else {
-        buft_layer_count[llama_default_buffer_type_cpu(true)] = n_layer;
+        buft_layer_count[llama_default_buffer_type_cpu(model, true)] = n_layer;
     }
 
     // create a context for each buffer type
@@ -2261,6 +2284,7 @@ static bool llama_kv_cache_init(
     for (auto it : ctx_map) {
         ggml_backend_buffer_type_t buft = it.first;
         ggml_context * ctx = it.second;
+//        fprintf(stderr, "ATTEMPTING TO INIT KV WITH BUFFER TYPE %s\n", ggml_backend_buft_name(buft));
         ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
         if (!buf) {
             LLAMA_LOG_ERROR("%s: failed to allocate buffer for kv cache\n", __func__);
@@ -3340,10 +3364,7 @@ static void llm_load_hparams(
     auto & hparams = model.hparams;
     const gguf_context * ctx = ml.ctx_gguf;
 
-#ifdef GGML_USE_MPI
-    model.ctx_mpi = ggml_mpi_init();
 
-#endif
 
     // get metadata as string
     for (int i = 0; i < gguf_get_n_kv(ctx); i++) {
@@ -4102,14 +4123,14 @@ static bool llm_load_tensors(
     const int64_t i_gpu_start = std::max((int64_t) hparams.n_layer - n_gpu_layers, (int64_t) 0);
 
     // there is very little benefit to offloading the input layer, so always keep it on the CPU
-    model.buft_input = llama_default_buffer_type_cpu(true);
+    model.buft_input = llama_default_buffer_type_cpu(model, true);
     //model.buft_input = llama_default_buffer_type_offload(main_gpu);
 
     model.buft_layer.resize(n_layer);
 
     // assign cpu layers
     for (int64_t i = 0; i < i_gpu_start; ++i) {
-        model.buft_layer[i] = llama_default_buffer_type_cpu(true);
+        model.buft_layer[i] = llama_default_buffer_type_cpu(model, true);
     }
 
     if (split_mode == LLAMA_SPLIT_MODE_LAYER) {
@@ -4140,57 +4161,70 @@ static bool llm_load_tensors(
         int act_gpu_layers = std::min(n_gpu_layers, (int)n_layer + 1);
         for (int64_t i = i_gpu_start; i < n_layer; ++i) {
             int layer_gpu = std::upper_bound(splits.begin(), splits.begin() + device_count, float(i - i_gpu_start)/act_gpu_layers) - splits.begin();
-            model.buft_layer[i] = llama_default_buffer_type_offload(layer_gpu);
+            model.buft_layer[i] = llama_default_buffer_type_offload(model, layer_gpu);
         }
         // assign the output layer
         if (n_gpu_layers > n_layer) {
             int layer_gpu = std::upper_bound(splits.begin(), splits.begin() + device_count, float(act_gpu_layers - 1)/act_gpu_layers) - splits.begin();
-            model.buft_output = llama_default_buffer_type_offload(layer_gpu);
+            model.buft_output = llama_default_buffer_type_offload(model, layer_gpu);
         } else {
-            model.buft_output = llama_default_buffer_type_cpu(true);
+            model.buft_output = llama_default_buffer_type_cpu(model, true);
         }
     } else {
         ggml_backend_buffer_type_t split_buft;
         if (split_mode == LLAMA_SPLIT_MODE_ROW) {
-            split_buft = llama_default_buffer_type_split(main_gpu, tensor_split);
+            split_buft = llama_default_buffer_type_split(model, main_gpu, tensor_split);
         } else {
             // LLAMA_SPLIT_MODE_NONE or LLAMA_SPLIT_MODE_LAYER in backends where it is not supported
-            split_buft = llama_default_buffer_type_offload(main_gpu);
+            split_buft = llama_default_buffer_type_offload(model, main_gpu);
         }
         // assign the repeating layers
         for (int64_t i = i_gpu_start; i < n_layer; ++i) {
             model.buft_layer[i] = {
-                    llama_default_buffer_type_offload(main_gpu),
-                llama_default_buffer_type_offload(main_gpu)
+                    llama_default_buffer_type_offload(model, main_gpu),
+                llama_default_buffer_type_offload(model, main_gpu)
             };
         }
         // assign the output layer
         if (n_gpu_layers > n_layer) {
             model.buft_output = {
-                    llama_default_buffer_type_offload(main_gpu),
-                llama_default_buffer_type_offload(main_gpu)
+                    llama_default_buffer_type_offload(model, main_gpu),
+                llama_default_buffer_type_offload(model, main_gpu)
             };
         } else {
-            model.buft_output = llama_default_buffer_type_cpu(true);
+            model.buft_output = llama_default_buffer_type_cpu(model, true);
         }
     }
 
 #ifdef GGML_USE_MPI
-    model.buft_output = llama_default_buffer_type_cpu(true);
+    model.buft_output = llama_default_buffer_type_cpu(model, true);
+    ggml_backend_mpi_buffer_type_init_with_context(model.buft_output.buft, model.ctx_mpi);
+    ggml_backend_mpi_buffer_type_init_with_context(model.buft_output.buft_matrix, model.ctx_mpi);
+
+
+    ggml_backend_mpi_buffer_type_init_with_context(model.buft_input.buft, model.ctx_mpi);
+    ggml_backend_mpi_buffer_type_init_with_context(model.buft_input.buft_matrix, model.ctx_mpi);
 
     uint16_t** ranges = ggml_mpi_split_range(model.ctx_mpi, 0, n_layer-1, node_split);
 
 
     size_t size = ggml_mpi_size(model.ctx_mpi);
+    fprintf(stderr, "Partition size: %zu\n", size);
+    fprintf(stderr, "Partition rank: %d\n", ggml_mpi_rank(model.ctx_mpi));
+
 
     for (size_t i = 0; i < size; i++) {
-        model.buft_layer[ranges[i][0]].buft = llama_default_buffer_type_cpu(true);
-        model.buft_layer[ranges[i][0]].buft_matrix = llama_default_buffer_type_cpu(true);
+        model.buft_layer[ranges[i][0]].buft = llama_default_buffer_type_cpu(model, true);
+        model.buft_layer[ranges[i][0]].buft_matrix = llama_default_buffer_type_cpu(model, true);
 
-        model.buft_layer[ranges[i][1]].buft = llama_default_buffer_type_cpu(true);
-        model.buft_layer[ranges[i][1]].buft_matrix = llama_default_buffer_type_cpu(true);
+        model.buft_layer[ranges[i][1]].buft = llama_default_buffer_type_cpu(model, true);
+        model.buft_layer[ranges[i][1]].buft_matrix = llama_default_buffer_type_cpu(model, true);
         for (uint16_t j = ranges[i][0]; j <= ranges[i][1]; j++) {
             printf("Setting buffer rank for i %zu and j %d\n", i, j);
+            ggml_backend_mpi_buffer_type_init_with_context(model.buft_layer[j].buft, model.ctx_mpi);
+            ggml_backend_mpi_buffer_type_init_with_context(model.buft_layer[j].buft_matrix, model.ctx_mpi);
+
+
             ggml_backend_mpi_buffer_type_set_rank(model.buft_layer[j].buft, (int)i);
             ggml_backend_mpi_buffer_type_set_rank(model.buft_layer[j].buft_matrix, (int)i);
         }
@@ -4202,10 +4236,11 @@ static bool llm_load_tensors(
     ggml_backend_mpi_buffer_type_set_rank(model.buft_input.buft, 0);
     ggml_backend_mpi_buffer_type_set_rank(model.buft_input.buft_matrix, 0);
 
-
+    ggml_backend_mpi_buffer_type_set_rank(model.buft_output.buft, (int)size - 1);
+    ggml_backend_mpi_buffer_type_set_rank(model.buft_output.buft_matrix, (int)size - 1);
     // Outputs *must* be on node 0, otherwise a deadlock occurs
-    ggml_backend_mpi_buffer_type_set_rank(model.buft_output.buft, 0);
-    ggml_backend_mpi_buffer_type_set_rank(model.buft_output.buft_matrix, 0);
+//    ggml_backend_mpi_buffer_type_set_rank(model.buft_output.buft, 0);
+//    ggml_backend_mpi_buffer_type_set_rank(model.buft_output.buft_matrix, 0);
 #endif
 
     // count used buffer types
@@ -5084,6 +5119,12 @@ static bool llm_load_tensors(
 
     ml.init_mapping(true, use_mlock ? &model.mlock_mmap : nullptr);
 
+#ifdef GGML_USE_MPI
+    if (ggml_mpi_size(model.ctx_mpi) < 1) {
+        return true;
+    }
+#endif
+
     // create the backend buffers
     std::vector<std::pair<ggml_context *, ggml_backend_buffer_t>> ctx_bufs;
 
@@ -5095,7 +5136,7 @@ static bool llm_load_tensors(
         // only the mmap region containing the tensors in the model is mapped to the backend buffer
         // this is important for metal with apple silicon: if the entire model could be mapped to a metal buffer, then we could just use metal for all layers
         // this allows using partial offloading when the model size exceeds the metal buffer size, but not the RAM size
-        if (ml.use_mmap && buft == llama_default_buffer_type_cpu(true)) {
+        if (ml.use_mmap && buft == llama_default_buffer_type_cpu(model, true)) {
             size_t first, last;
             ml.get_mapping_range(&first, &last, ctx);
             buf = ggml_backend_cpu_buffer_from_ptr((char *) ml.mapping->addr + first, last - first);
@@ -5109,6 +5150,8 @@ static bool llm_load_tensors(
 #endif
 #ifdef GGML_USE_MPI
             buf = ggml_backend_mpi_wrap_buffer(buf);
+            ggml_backend_mpi_buffer_init_with_context(buf, model.ctx_mpi);
+
 #endif
         }
 #ifdef GGML_USE_METAL
@@ -5120,7 +5163,7 @@ static bool llm_load_tensors(
         }
 #endif
         else {
-            fprintf(stderr, "Allocating context tensors from buffer type %s\n", ggml_backend_buft_name(buft));
+//            fprintf(stderr, "Allocating context tensors from buffer type %s\n", ggml_backend_buft_name(buft));
             buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
             if (buf != nullptr && use_mlock && ggml_backend_buffer_is_host(buf)) {
                 model.mlock_bufs.emplace_back(new llama_mlock);
@@ -5247,7 +5290,7 @@ static int llama_model_load(const std::string & fname, llama_model & model, llam
 #endif
 
         if (!llm_load_tensors(
-            ml, model, params.n_gpu_layers, params.split_mode,  params.main_gpu, params.tensor_split, params.node_layer_weights, params.use_mlock,
+            ml, model, params.n_gpu_layers, params.split_mode,  params.main_gpu, params.tensor_split, params.node_layer_weights[params.model_partition], params.use_mlock,
             params.progress_callback, params.progress_callback_user_data
         )) {
             return -2;
@@ -9068,6 +9111,27 @@ static void llama_graph_compute(
 
 }
 
+bool abort_callback(struct ggml_tensor * t, bool ask, void * data) {
+    auto * pair = (std::pair<std::unordered_map<int, bool>*, int>*)data;
+    auto canceled_batches = *pair->first;
+    auto batch_id = pair->second;
+    auto it = canceled_batches.find(batch_id);
+    if (it != canceled_batches.end() && canceled_batches[batch_id]) {
+        return false;
+    }
+//    if (ggml_mpi_iprobe(lctx.model.ctx_mpi, ggml_mpi_next_node(lctx.model.ctx_mpi), GGML_MPI_CANCEL_RUN)) {
+//        int count = ggml_mpi_status_count_int32(lctx.model.ctx_mpi);
+////                    printf("\nReceived async cancel run, count of %d\n", count);
+//        {
+//            std::vector<int32_t> canceled(count, -1);
+//            llama_cancel_run(&lctx, canceled.data(), canceled.size());
+//
+//        }
+//
+//    }
+    return true;
+}
+
 // decode a batch of tokens by evaluating the transformer
 //
 //   - lctx:      llama context
@@ -9083,20 +9147,26 @@ static int llama_decode_internal(
 
 
 #ifdef GGML_USE_MPI
-    if (ggml_mpi_rank(lctx.model.ctx_mpi) == 0 && ggml_mpi_size(lctx.model.ctx_mpi) > 1) {
-        int transaction_type = GGML_MPI_DECODE;
-        ggml_mpi_sync_ints_pipelined(lctx.model.ctx_mpi, &transaction_type, 1, GGML_MPI_BEGIN_TRANSACTION);
-    }
+    if (ggml_mpi_size(lctx.model.ctx_mpi) >= 1) {
+        if (ggml_mpi_rank(lctx.model.ctx_mpi) == 0 && ggml_mpi_size(lctx.model.ctx_mpi) > 1) {
+            int transaction_type = GGML_MPI_DECODE;
+            ggml_mpi_sync_ints_pipelined(lctx.model.ctx_mpi, &transaction_type, 1, GGML_MPI_BEGIN_TRANSACTION);
+        }
 //    ggml_mpi_sync_ints_pipelined(lctx.model.ctx_mpi, &batch_all.batch_id, 1, GGML_MPI_BATCH_ID);
-    int old_tokens = batch_all.n_tokens;
+        int old_tokens = batch_all.n_tokens;
 
-    ggml_mpi_sync_ints_pipelined(lctx.model.ctx_mpi, &batch_all.n_tokens, 1, GGML_MPI_N_TOKENS);
+        ggml_mpi_sync_ints_pipelined(lctx.model.ctx_mpi, &batch_all.n_tokens, 1, GGML_MPI_N_TOKENS);
 
-    ggml_mpi_sync_ints_pipelined(lctx.model.ctx_mpi, reinterpret_cast<int32_t *>(&lctx.cparams.n_seq_max), 1, GGML_MPI_MAX_N_SEQ);
-    if (ggml_mpi_rank(lctx.model.ctx_mpi) > 0) {
-        int new_n_tokens = batch_all.n_tokens;
-        llama_batch_free(batch_all);
-        batch_all = llama_batch_init(new_n_tokens, 0, (int32_t)lctx.cparams.n_seq_max);
+        ggml_mpi_sync_ints_pipelined(lctx.model.ctx_mpi, reinterpret_cast<int32_t *>(&lctx.cparams.n_seq_max), 1,
+                                     GGML_MPI_MAX_N_SEQ);
+        if (ggml_mpi_rank(lctx.model.ctx_mpi) > 0) {
+            int new_n_tokens = batch_all.n_tokens;
+//            llama_batch_free(batch_all);
+            batch_all = llama_batch_init(new_n_tokens, 0, (int32_t) lctx.cparams.n_seq_max);
+        }
+    }
+    if (ggml_mpi_size(lctx.model.ctx_mpi) < 1) {
+        return 0;
     }
 #endif
 
@@ -9132,8 +9202,26 @@ static int llama_decode_internal(
     }
 
 #ifdef GGML_USE_MPI
-    ggml_mpi_eval_init(lctx.model.ctx_mpi, &(batch_all.n_tokens), &(batch_all.pos), &(batch_all.n_seq_id), &(batch_all.seq_id), &(batch_all.logits), lctx.cparams.n_seq_max);
+
+    ggml_mpi_eval_init(lctx.model.ctx_mpi, &(batch_all.n_tokens), &(batch_all.pos), &(batch_all.n_seq_id), &(batch_all.seq_id), &(batch_all.logits), lctx.cparams.n_seq_max, &(batch_all.batch_id));
     n_tokens_all = batch_all.n_tokens;
+
+//    if (ggml_mpi_iprobe(lctx.ctx_mpi, ggml_mpi_next_node(lctx.ctx_mpi), GGML_MPI_CANCEL_RUN)) {
+//        int count = ggml_mpi_status_count_int32(lctx.ctx_mpi);
+////            printf("Received async cancel run\n");
+//        {
+//            std::vector<int32_t> canceled(count, -1);
+//            llama_cancel_run(&lctx, canceled.data(), canceled.size());
+//
+//        }
+//    }
+//    if (!ggml_mpi_graph_compute_pre(lctx.ctx_mpi, gf)) {
+//        return nullptr;
+//    }
+//    auto it = lctx.model.canceled_batches.find(batch_all.batch_id);
+//    if (!(it == lctx.model.canceled_batches.end() || !lctx.model.canceled_batches[batch_all.batch_id])) {
+//
+//    }
 #endif
 
     if (n_tokens_all == 0) {
@@ -9189,7 +9277,7 @@ static int llama_decode_internal(
             /* .logits     = */ batch_all.logits    ? batch_all.logits   + cur_token        : nullptr,
             /* .all_pos_0  = */ batch_all.all_pos_0 + (llama_pos) cur_token*batch_all.all_pos_1,
             /* .all_pos_1  = */ batch_all.all_pos_1,
-            /* .all_seq_id = */ batch_all.all_seq_id,
+            /* .all_seq_id = */ batch_all.all_seq_id, batch_all.batch_id
         };
 
         int n_threads = n_tokens == 1 ? cparams.n_threads : cparams.n_threads_batch;
@@ -9246,6 +9334,11 @@ static int llama_decode_internal(
 
         //printf("kv_self.n = %5d, kv_self.used = %5d, kv_self.head = %5d\n", kv_self.n, kv_self.used, kv_self.head);
 
+
+//        auto* data = new std::pair<std::unordered_map<int, bool>*, int>;
+//        data->first = new std::unordered_map<int, bool>;
+//        *data->first = lctx.model.canceled_batches;
+//        data->second = batch_all.batch_id;
         ggml_backend_sched_reset(lctx.sched);
         ggml_backend_sched_set_eval_callback(lctx.sched, lctx.cparams.cb_eval, lctx.cparams.cb_eval_user_data);
 
@@ -9291,6 +9384,9 @@ static int llama_decode_internal(
         llama_set_inputs(lctx, u_batch);
 
         llama_graph_compute(lctx, gf, n_threads);
+        ggml_backend_sched_set_eval_callback(lctx.sched, nullptr, nullptr);
+//        lctx.model.canceled_batches = *data->first;
+
 
         // update the kv ring buffer
         {
@@ -9314,7 +9410,7 @@ static int llama_decode_internal(
         //}
 
 #ifdef GGML_USE_MPI
-        if (ggml_mpi_rank(lctx.model.ctx_mpi) == 0) {
+        if (ggml_mpi_rank(lctx.model.ctx_mpi) == 0 || ggml_mpi_rank(lctx.model.ctx_mpi) == (int)ggml_mpi_size(lctx.model.ctx_mpi) - 1) {
 #endif
 
         // extract logits
@@ -9324,6 +9420,7 @@ static int llama_decode_internal(
 
 
         ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(lctx.sched, res);
+        lctx.model.waiting_backends.push_back(backend_res);
             GGML_ASSERT(backend_res != nullptr);
             if (u_batch.logits) {
                 int32_t i_first = -1;
@@ -9393,12 +9490,12 @@ static int llama_decode_internal(
                         embd_seq_out.clear();
 
                         for (uint32_t i = 0; i < n_tokens; i++) {
-                            const llama_seq_id seq_id = u_batch.seq_id[i][0];
-                            if (embd_seq_out.find(seq_id) != embd_seq_out.end()) {
+                            const llama_seq_id id = u_batch.seq_id[i][0];
+                            if (embd_seq_out.find(id) != embd_seq_out.end()) {
                                 continue;
                             }
-                            embd_seq_out[seq_id].resize(n_embd);
-                            ggml_backend_tensor_get_async(backend_embd, embd, embd_seq_out[seq_id].data(), (n_embd*seq_id)*sizeof(float), n_embd*sizeof(float));
+                            embd_seq_out[id].resize(n_embd);
+                            ggml_backend_tensor_get_async(backend_embd, embd, embd_seq_out[id].data(), (n_embd * id) * sizeof(float), n_embd * sizeof(float));
                         }
                     } break;
                 case LLAMA_POOLING_TYPE_UNSPECIFIED:
@@ -12955,7 +13052,11 @@ static int llama_apply_lora_from_file_internal(
 //
 struct llama_model_params llama_model_default_params() {
     struct llama_model_params result = {
-            static_cast<float *>(calloc(1, sizeof(float))),
+        /*.num_partitions              =*/ 0,
+        /*.model_partition             =*/ 0,
+        /*.nodes_per_partition         =*/ nullptr,
+        /*.node_ids                    =*/ nullptr,
+        /*.node_layer_weights          =*/ static_cast<const float **>(calloc(1, sizeof(float*))),
         /*.n_gpu_layers                =*/ 0,
         /*.split_mode                  =*/ LLAMA_SPLIT_MODE_LAYER,
         /*.main_gpu                    =*/ 0,
@@ -13031,6 +13132,14 @@ int llama_node_id(struct llama_context * ctx) {
     return 0;
 }
 
+bool llama_is_active_partition(struct llama_context * ctx) {
+#ifdef GGML_USE_MPI
+    return ggml_mpi_size(ctx->model.ctx_mpi) >= 1;
+
+#endif
+    return true;
+}
+
 size_t llama_max_devices(void) {
 #if defined(GGML_USE_METAL)
     return 1;
@@ -13102,7 +13211,45 @@ struct llama_model * llama_load_model_from_file(
     ggml_time_init();
 
     llama_model * model = new llama_model;
+#ifdef GGML_USE_MPI
+    model->ctx_mpi = ggml_mpi_init();
 
+    int local_node_id = ggml_mpi_rank(model->ctx_mpi);
+    bool found = false;
+    fprintf(stderr, "Model partition: %d, num partitions: %d\n", params.model_partition, (int)params.num_partitions);
+    GGML_ASSERT(params.node_ids != nullptr);
+
+    model->mpi_partitions.push_back(model->ctx_mpi);
+
+    for (size_t i = 0; i < params.num_partitions; i++) {
+        if (params.node_ids[i][0] == (size_t)local_node_id) {
+            fprintf(stderr, "FOUND ROOT NODE FOR PARTITION %zu AND LOCAL RANK %i\n", i, local_node_id);
+            found = true;
+            break;
+        } else {
+            fprintf(stderr, "DID NOT FIND ROOT NODE FOR PARTITION %zu, LOCAL RANK %i, AND PARTITION NODE ID %zu\n", i, local_node_id, params.node_ids[i][0]);
+
+        }
+    }
+
+    model->mpi_partitions.push_back(ggml_mpi_split_comm(model->ctx_mpi, (found) ? 0 : -1, local_node_id));
+
+    found = false;
+
+    if (params.model_partition < (int)params.num_partitions) {
+        for (size_t i = 0; i < params.nodes_per_partition[params.model_partition]; i++) {
+            fprintf(stderr, "Checking node id of node %zu\n", i);
+            GGML_ASSERT(params.node_ids[params.model_partition] != nullptr);
+            if (params.node_ids[params.model_partition][i] == local_node_id) {
+                found = true;
+                break;
+            }
+        }
+    }
+    model->ctx_mpi = ggml_mpi_split_comm(model->ctx_mpi, (found) ? params.model_partition : -1, local_node_id);
+    model->mpi_partitions.push_back(model->ctx_mpi);
+
+#endif
     unsigned cur_percentage = 0;
     if (params.progress_callback == NULL) {
         params.progress_callback_user_data = &cur_percentage;
@@ -13346,7 +13493,7 @@ struct llama_context * llama_new_context_with_model(
 
         for (size_t i = 0; i < ggml_mpi_size(model->ctx_mpi); i++) {
             for (auto & backend : ctx->backends) {
-                new_backends.push_back(ggml_backend_mpi_init(std::vector<ggml_backend_t>{backend, ctx->backend_cpu}.data(), 2, (int) i));
+                new_backends.push_back(ggml_backend_mpi_init(model->ctx_mpi, std::vector<ggml_backend_t>{backend, ctx->backend_cpu}.data(), 2, (int) i));
             }
         }
 
@@ -13355,7 +13502,9 @@ struct llama_context * llama_new_context_with_model(
 
 
 //        ctx->backend_cpu = ctx->backends.back();
-        ctx->backends.push_back(ggml_backend_mpi_init(&ctx->backend_cpu, 1, ggml_mpi_rank(model->ctx_mpi)));
+        ctx->backends.push_back(ggml_backend_mpi_init(model->ctx_mpi, &ctx->backend_cpu, 1, ggml_mpi_rank(model->ctx_mpi)));
+        ctx->logits = new float[model->hparams.n_vocab*100];
+        llama_switch_partition(ctx, MPI_PARTITION_MODEL);
 
 #endif
 
@@ -13383,6 +13532,13 @@ struct llama_context * llama_new_context_with_model(
                 ggml_type_name(type_v), (float)memory_size_v / (1024.0f * 1024.0f));
         }
 
+#ifdef GGML_USE_MPI
+        if (ggml_mpi_size(model->ctx_mpi) < 1) {
+
+            return ctx;
+        }
+#endif
+
         // graph outputs buffer
         {
             // resized during inference, reserve maximum
@@ -13391,7 +13547,7 @@ struct llama_context * llama_new_context_with_model(
 
             const size_t buf_output_size = (ctx->logits_size + ctx->embd_size)*sizeof(float);
 
-            ctx->buf_output = ggml_backend_buft_alloc_buffer(llama_default_buffer_type_cpu(true), buf_output_size);
+            ctx->buf_output = ggml_backend_buft_alloc_buffer(ggml_backend_get_default_buffer_type(ctx->backend_cpu), buf_output_size);
             if (ctx->buf_output == nullptr) {
                 LLAMA_LOG_ERROR("%s: failed to allocate logits buffer\n", __func__);
                 llama_free(ctx);
@@ -13417,7 +13573,7 @@ struct llama_context * llama_new_context_with_model(
             for (auto * backend : ctx->backends) {
                 if (ggml_backend_is_cpu(backend)) {
                     // use host buffers for the CPU backend compute buffer
-                    backend_buft.push_back(llama_default_buffer_type_cpu(true));
+                    backend_buft.push_back(llama_default_buffer_type_cpu(*model, true));
                 } else {
                     backend_buft.push_back(ggml_backend_get_default_buffer_type(backend));
                 }
@@ -13432,6 +13588,10 @@ struct llama_context * llama_new_context_with_model(
             // pipeline parallelism requires support for async compute and events
             // currently this is only implemented in the CUDA backend
             pipeline_parallel = false;
+#endif
+
+#ifdef GGML_USE_MPI
+            pipeline_parallel = true;
 #endif
             ctx->sched = ggml_backend_sched_new(ctx->backends.data(), backend_buft.data(), ctx->backends.size(), LLAMA_MAX_NODES, pipeline_parallel);
 
@@ -14440,12 +14600,12 @@ struct llama_batch llama_batch_get_one(
         /*logits         =*/ nullptr,
         /*all_pos_0      =*/ pos_0,
         /*all_pos_1      =*/ 1,
-        /*all_seq_id     =*/ seq_id,
+        /*all_seq_id     =*/ seq_id, 0
     };
 }
 
 struct llama_batch llama_batch_init(int32_t n_tokens_alloc, int32_t embd, int32_t n_seq_max) {
-    llama_batch batch = { 0, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, 0, };
+    llama_batch batch = { 0, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, 0, 0};
 
     if (embd) {
         batch.embd = (float *) malloc(sizeof(float) * n_tokens_alloc * embd);
@@ -14472,9 +14632,9 @@ void llama_batch_free(struct llama_batch batch) {
     if (batch.pos)      free(batch.pos);
     if (batch.n_seq_id) free(batch.n_seq_id);
     if (batch.seq_id) {
-        for (int i = 0; batch.seq_id[i] != nullptr; ++i) {
-            free(batch.seq_id[i]);
-        }
+//        for (int i = 0; batch.seq_id[i] != nullptr; ++i) {
+//            free(batch.seq_id[i]);
+//        }
         free(batch.seq_id);
     }
     if (batch.logits)   free(batch.logits);
@@ -14485,9 +14645,72 @@ void llama_batch_free(struct llama_batch batch) {
     batch.n_seq_id = nullptr;
     batch.seq_id = nullptr;
     batch.logits = nullptr;
+    batch.n_tokens = 0;
 }
 
 #ifdef GGML_USE_MPI
+
+void llama_switch_partition(struct llama_context * ctx, size_t partition) {
+    ctx->model.mpi_switch_partitions(partition);
+}
+
+bool llama_mpi_iprobe(struct llama_context * lctx) {
+    return ggml_mpi_iprobe(lctx->model.ctx_mpi, ggml_mpi_prev_node(lctx->model.ctx_mpi), GGML_MPI_SYNC_LOGITS);
+}
+
+void llama_cancel_run(struct llama_context * ctx, int32_t * canceled, int count) {
+    ggml_mpi_sync_ints_pipelined_back(ctx->model.ctx_mpi, canceled, count, GGML_MPI_CANCEL_RUN);
+    for (int i = 0; i < count; i++) {
+        int32_t run_id = canceled[i];
+        auto it = ctx->model.canceled_batches.find(run_id);
+        if (it != ctx->model.canceled_batches.end()) {
+            it->second = true;
+        } else {
+            ctx->model.canceled_batches.insert({run_id, true});
+//            ctx->canceled_batches[run_id] = true;
+        }
+    }
+}
+
+bool llama_mpi_test_recv(struct llama_context * lctx) {
+    if (ggml_mpi_size(lctx->model.ctx_mpi) > 0) {
+//        fprintf(stderr, "LLAMA TESTING FOR RECV WITH NUM BACKENDS %d\n", ggml_backend_sched_get_n_backends(lctx->sched));
+        for (int i = 0; i < ggml_backend_sched_get_n_backends(lctx->sched); i++) {
+            if (ggml_mpi_test_recv(ggml_backend_sched_get_backends(lctx->sched)[i])) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+void llama_pop_request(struct llama_context * lctx) {
+    if (ggml_mpi_size(lctx->model.ctx_mpi) > 0) {
+        for (int i = 0; i < ggml_backend_sched_get_n_backends(lctx->sched); i++) {
+            ggml_backend_mpi_pop_request(ggml_backend_sched_get_backends(lctx->sched)[i]);
+        }
+    }
+}
+
+void llama_sync_int32_t(struct llama_context * ctx, int32_t * val, int root) {
+#ifdef GGML_USE_MPI
+    ggml_mpi_sync_int32_t(ctx->model.ctx_mpi, val, root);
+#endif
+}
+
+void llama_sync_bool(struct llama_context * ctx, bool * val, int root) {
+#ifdef GGML_USE_MPI
+    ggml_mpi_sync_bool(ctx->model.ctx_mpi, val, root);
+#endif
+}
+
+void llama_sync_token_data(struct llama_context * ctx, llama_token_data * data, int root) {
+#ifdef GGML_USE_MPI
+    ggml_mpi_sync_int32_t(ctx->model.ctx_mpi, &(data->id), root);
+    ggml_mpi_sync_float(ctx->model.ctx_mpi, &(data->logit), root);
+    ggml_mpi_sync_float(ctx->model.ctx_mpi, &(data->p), root);
+#endif
+}
 
 int llama_process_mpi_transaction(
         struct llama_context * ctx,
@@ -14499,7 +14722,7 @@ int llama_process_mpi_transaction(
 
     switch (tag) {
         case GGML_MPI_DECODE:
-//            llama_batch_free(batch);
+            llama_batch_free(batch);
             return llama_decode_internal(*ctx, batch);
             break;
         case GGML_MPI_KV_CLEAR:
@@ -14553,14 +14776,14 @@ int llama_process_mpi_worker(
             exit(0);
             break;
         case GGML_MPI_CANCEL_RUN:
-//            count = ggml_mpi_status_count_int32(ctx->model.ctx_mpi);
-////            printf("Received cancel run\n");
-//            {
-//                std::vector<int32_t> canceled(count, -1);
-//                llama_cancel_run(ctx, canceled.data(), canceled.size());
-//
-//            }
-//            break;
+            count = ggml_mpi_status_count_int32(ctx->model.ctx_mpi);
+//            printf("Received cancel run\n");
+            {
+                std::vector<int32_t> canceled(count, -1);
+                llama_cancel_run(ctx, canceled.data(), canceled.size());
+
+            }
+            break;
         default:
             printf("Unknown non-transaction operation %d, exiting\n", tag);
             exit(1);
@@ -14592,6 +14815,9 @@ int32_t llama_decode(
 }
 
 void llama_synchronize(struct llama_context * ctx) {
+    if (ggml_mpi_size(ctx->model.ctx_mpi) < 1) {
+        return;
+    }
     ggml_backend_sched_synchronize(ctx->sched);
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
@@ -14624,7 +14850,7 @@ float * llama_get_logits(struct llama_context * ctx) {
 }
 
 float * llama_get_logits_ith(struct llama_context * ctx, int32_t i) {
-    assert(ctx->logits_valid.at(i));
+//    assert(ctx->logits_valid.at(i));
 
     llama_synchronize(ctx);
 

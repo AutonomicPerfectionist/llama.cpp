@@ -921,13 +921,47 @@ static bool gpt_params_find_arg(int argc, char ** argv, gpt_params & params, int
         std::string arg_next = argv[i];
 
         // split string by , and /
-        const std::regex regex{R"([,/]+)"};
+        const std::regex regex{R"([\/]+)"};
+        const std::regex inner_regex{R"([,]+)"};
+
         std::sregex_token_iterator it{arg_next.begin(), arg_next.end(), regex, -1};
         std::vector<std::string> split_arg{it, {}};
         params.mpi_layer_split.resize(split_arg.size());
-        for (size_t node = 0; node < split_arg.size(); ++node) {
-            params.mpi_layer_split[node] = std::stof(split_arg[node]);
+        for (size_t partition = 0; partition < split_arg.size(); ++partition) {
+            std::sregex_token_iterator it_inner{split_arg[partition].begin(), split_arg[partition].end(), inner_regex, -1};
+            std::vector<std::string> split_arg_inner{it_inner, {}};
+            params.mpi_layer_split[partition].resize(split_arg_inner.size());
+            for (size_t j = 0; j < split_arg_inner.size(); ++j) {
+                params.mpi_layer_split[partition][j] = std::stof(split_arg_inner[j]);
+            }
         }
+        return true;
+    }
+
+    if (arg == "--p-recovery" || arg == "-pr") {
+        if (++i >= argc) {
+            invalid_param = true;
+            return true;
+        }
+        params.p_recovery = std::stof(argv[i]);
+        return true;
+    }
+
+     if (arg == "--p-decay" || arg == "-pd") {
+         if (++i >= argc) {
+             invalid_param = true;
+             return true;
+         }
+         params.p_decay = std::stof(argv[i]);
+         return true;
+     }
+
+    if (arg == "--p-accept" || arg == "-pa") {
+        if (++i >= argc) {
+            invalid_param = true;
+            return true;
+        }
+        params.p_accept = std::stof(argv[i]);
         return true;
     }
 
@@ -1630,8 +1664,38 @@ struct llama_model_params llama_model_params_from_gpt_params(const gpt_params & 
 
     free((void *) mparams.node_layer_weights);
 
-    mparams.node_layer_weights = params.mpi_layer_split.data();
+    auto * weights = new std::vector<const float *>;
+    std::transform(params.mpi_layer_split.begin(), params.mpi_layer_split.end(), std::back_inserter(*weights), [](const std::vector<float> & item) {
+       return item.data();
+    });
 
+    mparams.node_layer_weights = weights->data();
+
+    mparams.model_partition = params.partition;
+
+    auto * nodes_per_partition = new std::vector<size_t>;
+    std::transform(params.mpi_layer_split.begin(), params.mpi_layer_split.end(), std::back_inserter(*nodes_per_partition), [](const std::vector<float> & item) {
+        return item.size();
+    });
+
+    mparams.nodes_per_partition = nodes_per_partition->data();
+    mparams.num_partitions = nodes_per_partition->size();
+
+    auto * node_ids = new std::vector<size_t*>;
+
+    size_t index = 0;
+
+    for (size_t i = 0; i < params.mpi_layer_split.size(); i++) {
+        auto * indices = new std::vector<size_t>();
+        indices->reserve(params.mpi_layer_split[i].size());
+        fprintf(stderr, "LAYER SPLIT %zu HAS SIZE %zu\n", i, params.mpi_layer_split[i].size());
+        for (size_t j = 0; j < params.mpi_layer_split[i].size(); j++) {
+            indices->push_back(index++);
+        }
+        node_ids->push_back(indices->data());
+    }
+
+    mparams.node_ids = node_ids->data();
     return mparams;
 }
 
@@ -1919,9 +1983,23 @@ struct llama_model * llama_load_model_from_url(const char * /*model_url*/, const
 
 #endif // LLAMA_USE_CURL
 
-std::tuple<struct llama_model *, struct llama_context *> llama_init_from_gpt_params(gpt_params & params) {
+std::tuple<struct llama_model *, struct llama_context *> llama_init_from_gpt_params(gpt_params & params, bool draft) {
+    auto old_model = params.model;
+    auto old_ngl = params.n_gpu_layers;
+    auto old_n_threads = params.n_threads;
+    auto old_n_threads_batch = params.n_threads_batch;
+    if (draft) {
+        params.partition = 1;
+        params.model = params.model_draft;
+        params.n_gpu_layers = params.n_gpu_layers_draft;
+        if (!params.n_threads_draft.empty()) {
+            params.n_threads = params.n_threads_draft;
+        }
+        params.n_threads_batch = params.n_threads_batch_draft;
+    }
     int32_t n_threads = params.n_threads[0];
     auto mparams = llama_model_params_from_gpt_params(params);
+//    GGML_ASSERT(mparams.node_ids[0][0] == 0 && mparams.node_ids[0][1] == 1);
 
     llama_model * model = nullptr;
     if (!params.model_url.empty()) {
@@ -2015,6 +2093,13 @@ std::tuple<struct llama_model *, struct llama_context *> llama_init_from_gpt_par
 #endif
         llama_reset_timings(lctx);
     }
+
+    params.model = old_model;
+    params.n_gpu_layers = old_ngl;
+
+    params.n_threads = old_n_threads;
+    params.n_threads_batch = old_n_threads_batch;
+    params.partition = 0;
 
     return std::make_tuple(model, lctx);
 }

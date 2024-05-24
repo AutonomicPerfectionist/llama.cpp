@@ -174,6 +174,8 @@ extern "C" {
     // if the user returns false, the scheduler will cancel the graph compute
     //
     typedef bool (*ggml_backend_sched_eval_callback)(struct ggml_tensor * t, bool ask, void * user_data);
+    GGML_API ggml_backend_t* ggml_backend_sched_get_backends(ggml_backend_sched_t sched);
+    GGML_API int ggml_backend_sched_get_n_backends(ggml_backend_sched_t sched);
 
     // Initialize a backend scheduler
     GGML_API ggml_backend_sched_t ggml_backend_sched_new(ggml_backend_t * backends, ggml_backend_buffer_type_t * bufts, int n_backends, size_t graph_size, bool parallel);

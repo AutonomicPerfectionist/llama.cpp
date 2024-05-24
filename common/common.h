@@ -60,11 +60,16 @@ struct gpt_params {
     int32_t n_chunks              = -1;    // max number of chunks to process (-1 = unlimited)
     int32_t n_parallel            = 1;     // number of parallel sequences to decode
     int32_t n_sequences           = 1;     // number of sequences to decode
+    float   p_accept               = 0.1f;  // speculative decoding split probability
+
     float   p_split               = 0.1f;  // speculative decoding split probability
+    float   p_recovery                      = 0.0f;  // Cumulative probability that p_accept and p_split are increased by per-iteration.
+    float   p_decay                         = 0.0f;  // Cumulative probability that p_accept and p_split are decreased by per-iteration when drafting stops due to p_accept.
     int32_t n_gpu_layers          = -1;    // number of layers to store in VRAM (-1 - use default)
     int32_t n_gpu_layers_draft    = -1;    // number of layers to store in VRAM for the draft model (-1 - use default)
     llama_split_mode split_mode   = LLAMA_SPLIT_MODE_LAYER; // how to split the model across GPUs
-    std::vector<float> mpi_layer_split      = {1.0}; // list of percentages of the total number of layers
+    std::vector<std::vector<float>> mpi_layer_split      = {{1.0}}; // list of percentages of the total number of layers
+    int  partition             = 0;
     int32_t main_gpu              = 0;     // the GPU that is used for scratch and small tensors
     float   tensor_split[128]     = {0};   // how split tensors should be distributed across GPUs
     int32_t n_beams               = 0;     // if non-zero then use beam search of given width.
@@ -187,7 +192,7 @@ std::string sampler_type_to_name_string(llama_sampler_type sampler_type);
 //
 
 // TODO: avoid tuplue, use struct
-std::tuple<struct llama_model *, struct llama_context *> llama_init_from_gpt_params(gpt_params & params);
+std::tuple<struct llama_model *, struct llama_context *> llama_init_from_gpt_params(gpt_params & params, bool draft = false);
 
 struct llama_model_params   llama_model_params_from_gpt_params  (const gpt_params & params);
 struct llama_context_params llama_context_params_from_gpt_params(const gpt_params & params);

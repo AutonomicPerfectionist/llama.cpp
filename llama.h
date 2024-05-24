@@ -183,6 +183,7 @@ extern "C" {
         llama_pos    all_pos_0;  // used if pos == NULL
         llama_pos    all_pos_1;  // used if pos == NULL
         llama_seq_id all_seq_id; // used if seq_id == NULL
+        size_t batch_id;
     } llama_batch;
 
     enum llama_model_kv_override_type {
@@ -203,7 +204,11 @@ extern "C" {
 
     struct llama_model_params {
         // Array of layers to allocate to each node
-        const float * node_layer_weights;
+        size_t num_partitions;
+        int model_partition;
+        size_t * nodes_per_partition;
+        size_t ** node_ids;
+        const float ** node_layer_weights;
 
         int32_t n_gpu_layers; // number of layers to store in VRAM
         enum llama_split_mode split_mode; // how to split the model across multiple GPUs
@@ -378,7 +383,21 @@ extern "C" {
     // Get the ID of this compute node, usually 0
     // unless running MPI, in which case it is the rank of the node
     LLAMA_API int llama_node_id(struct llama_context * ctx);
-    LLAMA_API bool llama_supports_mmap       (void);
+
+    LLAMA_API void llama_switch_partition(struct llama_context * ctx, size_t partition);
+
+    LLAMA_API bool llama_mpi_iprobe(struct llama_context * lctx);
+    LLAMA_API bool llama_mpi_test_recv(struct llama_context * lctx);
+    LLAMA_API void llama_pop_request(struct llama_context * lctx);
+
+    LLAMA_API void llama_cancel_run(struct llama_context * ctx, int32_t * canceled, int count);
+
+LLAMA_API void llama_sync_int32_t(struct llama_context * ctx, llama_token * token, int root);
+    LLAMA_API void llama_sync_bool(struct llama_context * ctx, bool * token, int root);
+    LLAMA_API void llama_sync_token_data(struct llama_context * ctx, llama_token_data * data, int root);
+    LLAMA_API bool llama_is_active_partition(struct llama_context * ctx);
+
+LLAMA_API bool llama_supports_mmap       (void);
     LLAMA_API bool llama_supports_mlock      (void);
     LLAMA_API bool llama_supports_gpu_offload(void);
 

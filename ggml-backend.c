@@ -1675,44 +1675,54 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
-        if (!sched->callback_eval) {
+        if (sched->callback_eval) {
+            bool need = sched->callback_eval(NULL, true, sched->callback_eval_user_data);
+            if (!need) {
+                continue;
+            }
+        }
+
+//        if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
             }
-        } else {
-            // similar to ggml_backend_compare_graph_backend
-            for (int j0 = 0; j0 < split->graph.n_nodes; j0++) {
-                struct ggml_tensor * t = split->graph.nodes[j0];
-
-                // check if the user needs data from this node
-                bool need = sched->callback_eval(t, true, sched->callback_eval_user_data);
-
-                int j1 = j0;
-
-                // determine the range [j0, j1] of nodes that can be computed together
-                while (!need && j1 < split->graph.n_nodes - 1) {
-                    t = split->graph.nodes[++j1];
-                    need = sched->callback_eval(t, true, sched->callback_eval_user_data);
-                }
-
-                struct ggml_cgraph gv = ggml_graph_view(&split->graph, j0, j1 + 1);
-
-                enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &gv);
-                if (ec != GGML_STATUS_SUCCESS) {
-                    return ec;
-                }
-
-                // TODO: pass backend to the callback, then the user can decide if they want to synchronize
-                ggml_backend_synchronize(split_backend);
-
-                if (need && !sched->callback_eval(t, false, sched->callback_eval_user_data)) {
-                    break;
-                }
-
-                j0 = j1;
-            }
-        }
+//        } else {
+//            // similar to ggml_backend_compare_graph_backend
+//            for (int j0 = 0; j0 < split->graph.n_nodes; j0++) {
+//                struct ggml_tensor * t = split->graph.nodes[j0];
+//
+//                // check if the user needs data from this node
+//                bool need = sched->callback_eval(t, true, sched->callback_eval_user_data);
+//                if (!need) {
+//                    break;
+//                }
+//
+//                int j1 = j0;
+//
+//                // determine the range [j0, j1] of nodes that can be computed together
+//                while (!need && j1 < split->graph.n_nodes - 1) {
+//                    t = split->graph.nodes[++j1];
+//                    need = sched->callback_eval(t, true, sched->callback_eval_user_data);
+//                }
+//
+//                struct ggml_cgraph gv = ggml_graph_view(&split->graph, j0, j1 + 1);
+//
+//                enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &gv);
+//                if (ec != GGML_STATUS_SUCCESS) {
+//                    return ec;
+//                }
+//
+//                // TODO: pass backend to the callback, then the user can decide if they want to synchronize
+//                ggml_backend_synchronize(split_backend);
+//
+//                if (need && !sched->callback_eval(t, false, sched->callback_eval_user_data)) {
+//                    break;
+//                }
+//
+//                j0 = j1;
+//            }
+//        }
 
         // record the event of this copy
         if (split->n_inputs > 0) {
@@ -1859,6 +1869,14 @@ void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
     for (int i = 0; i < sched->n_backends; i++) {
         ggml_backend_synchronize(sched->backends[i]);
     }
+}
+
+ggml_backend_t* ggml_backend_sched_get_backends(ggml_backend_sched_t sched) {
+    return sched->backends;
+}
+
+int ggml_backend_sched_get_n_backends(ggml_backend_sched_t sched) {
+    return sched->n_backends;
 }
 
 void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data) {

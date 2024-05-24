@@ -56,7 +56,11 @@ extern "C" {
 
 #define GGML_MPI_KV_SEQ_DIV 21
 
+#define MPI_PARTITION_WORLD 0
 
+#define MPI_PARTITION_ROOTS 1
+
+#define MPI_PARTITION_MODEL 2
 
 /**
  * The context used for MPI operations,
@@ -118,12 +122,19 @@ void ggml_mpi_sync_ints_pipelined_back(
         int count,
         int tag
 );
+
+int ggml_mpi_prev_node(struct ggml_mpi_context * ctx_mpi);
+int ggml_mpi_next_node(struct ggml_mpi_context * ctx_mpi);
 // clear = 1, rm = 2, cp = 3, keep = 4, seq_shift = 5
 void ggml_mpi_probe(struct ggml_mpi_context * ctx_mpi, int src, int tag);
 int ggml_mpi_status_tag(struct ggml_mpi_context * ctx_mpi);
 
 int ggml_mpi_iprobe(struct ggml_mpi_context * ctx_mpi, int src, int tag);
 int ggml_mpi_status_count_int32(struct ggml_mpi_context * ctx_mpi);
+
+bool ggml_mpi_test_recv(ggml_backend_t backend);
+
+GGML_CALL void ggml_backend_mpi_pop_request(ggml_backend_t backend);
 
 /**
  * Create a new context by splitting the given context's
@@ -199,12 +210,26 @@ void ggml_mpi_eval_init(
                 int32_t         **  n_seq_ids,
                 int32_t         *** seq_id,
                 int8_t          **  logits,
-                uint32_t            n_seq_max);
+                uint32_t            n_seq_max,
+                size_t             *   batch_id);
 
-void ggml_mpi_sync_int(
+void ggml_mpi_sync_int32_t(
         struct ggml_mpi_context     * ctx_mpi,
-                int32_t * val
+                int32_t * val,
+                int root
         );
+
+void ggml_mpi_sync_bool(
+        struct ggml_mpi_context     * ctx_mpi,
+        bool * val,
+        int root
+);
+
+void ggml_mpi_sync_float(
+        struct ggml_mpi_context * ctx_mpi,
+        float * val,
+        int root
+);
 
 /**
  * Split a range across all nodes within the given
@@ -242,11 +267,17 @@ struct ggml_mpi_device {
 #define MPI_BACKEND_NAME "MPI"
 GGML_CALL int ggml_backend_mpi_reg_devices();
 
-GGML_CALL ggml_backend_t ggml_backend_mpi_init(ggml_backend_t * wrapped_backends, size_t num_backends, int rank);
+GGML_CALL ggml_backend_t ggml_backend_mpi_init(ggml_mpi_context * ctx_mpi, ggml_backend_t * wrapped_backends, size_t num_backends, int rank);
 
 GGML_CALL void ggml_backend_mpi_buffer_type_set_rank(ggml_backend_buffer_type_t buft, int rank);
 
-GGML_CALL void ggml_backend_mpi_buffer_set_rank(ggml_backend_buffer_t buft, int rank);
+GGML_CALL void ggml_backend_mpi_buffer_type_init_with_context(ggml_backend_buffer_type_t buft, ggml_mpi_context * context);
+
+
+GGML_CALL void ggml_backend_mpi_buffer_set_rank(ggml_backend_buffer_t buff, int rank);
+
+GGML_CALL void ggml_backend_mpi_buffer_init_with_context(ggml_backend_buffer_t buff, ggml_mpi_context * context);
+
 
 #ifdef __cplusplus
 }
